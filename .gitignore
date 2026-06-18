@@ -1,0 +1,7 @@
+*.zip
+*.mbp
+/bot/csreg_scanner/_bin/regcheck
+/bot/csreg_scanner/regcheck_cli.py
+/bot/*.zip
+/bot/*.mbp
+/bot/csreg_scanner/__pycache__
