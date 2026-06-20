@@ -1,0 +1,91 @@
+# Codestorm reg scanner config
+
+# The room-ID of the policy list room
+policy_room: "!CHANGEME:codestorm.net"
+
+# Auto_config state event type. This event will control which servers this bot bans
+auto_config_event_type: "net.codestorm.csreg.auto_config"
+
+# ── Scanner (in-process registration checker) ───────────────────────────────
+scanner:
+  # Total per-target scan budget. Classification runs first under this budget;
+  # the federation /version probe uses whatever wall-clock remains.
+  # (recommended to leave above 120)
+  timeout_seconds: 150
+
+# ── Queue settings for NEW servers────────────────────────────────────────────
+queue:
+  # how often to check the queue and spawn scan tasks if there are new servers
+  scan_interval_seconds: 10
+  # limit for how many server to scan per interval. "up to... eg: 10"
+  scan_batch_limit: 20
+
+# ── Rescan settings. This controls the rescan behavior for KNOWN servers ─────
+rescan:
+  # same meaning as the queue settings
+  interval_seconds: 30
+  batch_limit: 200
+  # Per-status max staleness T (seconds). Shorter T = scanned more often.
+  # As the index grows, relax these or tweak interval and batch limit to keep 
+  # required rate within budget. 
+  # Check https://your-maubot/_matrix/maubot/plugin/<yourplugin-ID>/calc
+  staleness_seconds:
+    dangerously_open: 604800
+    open: 604800
+    oauth_open: 604800
+    oauth: 604800
+    unknown: 604800
+    closed: 604800
+
+# ── Ingress sources (all sources contribute to one shared scan queue) ────────
+sources:
+  # textfiles is a list that gets keyed on hostname in the logs ;)
+  textfiles:
+    - enabled: true
+      url: "https://example.org/matrix-servers.txt"
+      interval_seconds: 3600
+      # Optional arbitrary request headers (e.g. bearer auth for a list fronted
+      # by a proxy). Lives in YAML config only, never web-exposed, never logged.
+      # headers:
+      #   Authorization: "Bearer <token>"
+    # - enabled: true
+    #   url: "https://other.example/list-b.txt"
+    #   interval_seconds: 1800
+    #   headers:
+    #     Authorization: "Bearer <other-token>"
+
+  # see postgres section in the readme for how to setup
+  postgres:
+    enabled: false
+    dsn: "postgresql://cs_regscanner:mycrazysecurepassword@hostname.example/synapse"
+    query: "SELECT DISTINCT server_name FROM server_signature_keys"
+    interval_seconds: 10
+
+  # send a list of domains via webhook: {"servers": ["example1.org", "example2.org"]}
+  # to (`POST` request) https://this.mau.bot/_matrix/maubot/plugin/plugin-id/ingest
+  # This endpoint WILL NOT work without a auth header
+  webhook:
+    enabled: false
+    secret: ""                 # sent as: Authorization: Bearer <secret>
+  
+  # read the currently banned entities from the policylist as a source
+  policy_list:
+    enabled: false
+    interval_seconds: 1800
+
+# ── Policy writes ───────────────────────────────────────────────────────────
+policy:
+  # controls how many policies the bot can write per second
+  max_writes_per_second: 5
+
+# ── Metrics ─────────────────────────────────────────────────────────────────
+metrics:
+  enabled: true
+  # Per server metrics are disabled by default because this WILL explode the 
+  # cardinality, which is something prometheus generally doesn't like.
+  # If you don't know what this is and why this is a problem, just leave it as is :) 
+  expose_per_server: false
+  listen_host: "127.0.0.1"
+  listen_port: 9337
+  path: "/metrics"
+  counts_path: "/counts"

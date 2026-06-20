@@ -1,0 +1,21 @@
+maubot: 0.5.0
+id: net.codestorm.csreg-scanner
+version: 0.1.8
+license: MIT
+modules:
+  - csreg_scanner
+main_class: CSRegScanner
+
+database: true
+database_type: asyncpg
+config: true
+webapp: true
+
+dependencies:
+  - asyncpg>=0.29
+  - httpx>=0.28
+  - dnspython>=2.6
+extra_files:
+  - base-config.yaml
+  # Web based config value calculator
+  - csreg_scanner/web/calc.html

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codestorm csreg config calculator</title>
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23d60270'/%3E%3Cstop offset='0.4' stop-color='%239b4f96'/%3E%3Cstop offset='0.6' stop-color='%239b4f96'/%3E%3Cstop offset='1' stop-color='%230038a8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='url(%23b)'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#16181c; --panel:#1d2025; --panel2:#23272e; --line:#31363f;
+    --ink:#d6dae0; --ink-dim:#8a929e; --ink-faint:#5a626d;
+    --blue:#7fa8d6; --blue-dim:#4f6378; --red:#d68a8a; --red-dim:#8a4f4f;
+    --good:#8ab0c8; --bad:#d68a8a;
+    --mono:ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--mono);
+       font-size:14px;line-height:1.55;padding:24px;max-width:940px;
+       margin:0 auto}
+  h1{font-size:18px;font-weight:600;letter-spacing:.03em;margin:0 0 4px;
+     color:#eef1f5}
+  .sub{color:var(--ink-dim);margin:0 0 20px;font-size:13px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:7px;
+         padding:16px;margin-bottom:16px}
+  .panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.09em;
+            color:var(--ink-dim);margin:0 0 12px;font-weight:600}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--ink-dim);font-weight:500;font-size:12px;text-transform:uppercase}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tfoot th{color:var(--ink);border-bottom:none;border-top:1px solid var(--line)}
+  input[type=number]{background:var(--bg);border:1px solid var(--line);color:var(--ink);
+        font-family:var(--mono);font-size:14px;padding:5px 7px;width:10ch;
+        text-align:right;border-radius:4px}
+  input[type=number]:focus{outline:1px solid var(--blue)}
+  .row{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;margin-bottom:4px}
+  .fld{display:flex;flex-direction:column;gap:5px}
+  .fld label{font-size:12px;color:var(--ink-dim)}
+  /* the field currently being solved (its value is computed, not entered) */
+  .fld.solved input[type=number]{border-color:var(--blue-dim);background:#1a1e24}
+  /* a locked (pinned) field */
+  .fld.locked input[type=number]{border-color:var(--red-dim);
+        background:#241c1c;color:#eef1f5}
+  .lockline{display:flex;align-items:center;gap:6px;font-size:11px;
+            color:var(--ink-faint);margin-top:2px}
+  .lockline input{accent-color:var(--blue);cursor:pointer}
+  .lockline label{cursor:pointer;font-size:11px;color:var(--ink-faint)}
+  .lockline.is-locked label{color:var(--red)}
+  button{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+         font-family:var(--mono);font-weight:600;padding:8px 15px;
+         border-radius:5px;cursor:pointer;letter-spacing:.02em}
+  button:hover{border-color:var(--blue);color:#eef1f5}
+  button.accent{background:#243042;border-color:var(--blue-dim);color:var(--blue)}
+  button.accent:hover{background:#2a384c}
+  pre{background:#101216;border:1px solid var(--line);border-radius:5px;
+      padding:13px;overflow:auto;white-space:pre;color:#c3cad3;font-size:13px}
+  .verdict{padding:11px 13px;border-radius:5px;font-weight:600;margin-bottom:14px;
+           border:1px solid var(--line)}
+  .verdict.ok{background:rgba(127,168,214,.10);color:var(--blue);
+              border-color:var(--blue-dim)}
+  .verdict.bad{background:rgba(214,138,138,.10);color:var(--red);
+               border-color:var(--red-dim)}
+  .kv{display:flex;justify-content:space-between;gap:12px;padding:3px 0;
+      border-bottom:1px dotted var(--line)}
+  .kv:last-child{border-bottom:none}
+  .kv span:last-child{font-variant-numeric:tabular-nums;color:#eef1f5}
+  .err{color:var(--red)}
+  .warn{color:var(--red);font-size:12px;margin-top:8px}
+  .hint{color:var(--ink-faint);font-size:12px;margin-top:8px}
+  .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;
+        background:var(--panel2);color:var(--ink-dim);border:1px solid var(--line)}
+  a{color:var(--blue)}
+</style></head>
+<body>
+  <h1>Codestorm csreg config calculator</h1>
+  <p class="sub">reads /counts (no server list) &middot; edit staleness T &middot; lock safety / interval / batch_limit; an unlocked field solves</p>
+
+  <div class="panel">
+    <div class="row">
+      <button id="reload" class="accent">&#8635; reload /counts</button>
+      <span class="pill" id="qpill">queue: &ndash;</span>
+    </div>
+    <div id="loaderr" class="err"></div>
+  </div>
+
+  <div class="panel">
+    <h2>per-bucket staleness target (T) &amp; required rate</h2>
+    <table id="buckets">
+      <thead><tr>
+        <th>bucket</th><th class="num">N (servers)</th>
+        <th class="num">T = staleness_seconds</th><th class="num">N/T (scans/s)</th>
+      </tr></thead>
+      <tbody></tbody>
+      <tfoot><tr>
+        <th>&Sigma; required_rate</th><th class="num" id="sumN">&ndash;</th>
+        <th></th><th class="num" id="reqRate">&ndash;</th>
+      </tr></tfoot>
+    </table>
+    <p class="hint">N comes from /counts. T is yours to set &mdash; shorter T = scanned more eagerly = higher required rate. The bucket with the largest N/T dominates; relax its T first if the required rate is too high to meet.</p>
+  </div>
+
+  <div class="panel">
+    <h2>solver &mdash; an unlocked field solves; lock all three to just check</h2>
+    <div class="row">
+      <div class="fld" id="fld-safety">
+        <label for="safety">safety factor</label>
+        <input id="safety" type="number" min="1" step="0.1" value="1.5">
+        <span class="lockline"><input type="checkbox" id="lock-safety" data-lock="safety"><label for="lock-safety">lock</label></span>
+      </div>
+      <div class="fld" id="fld-interval">
+        <label for="interval">rescan.interval_seconds</label>
+        <input id="interval" type="number" min="1" step="1" value="60">
+        <span class="lockline"><input type="checkbox" id="lock-interval" data-lock="interval"><label for="lock-interval">lock</label></span>
+      </div>
+      <div class="fld" id="fld-batch">
+        <label for="batch">rescan.batch_limit</label>
+        <input id="batch" type="number" min="1" step="1" value="200">
+        <span class="lockline"><input type="checkbox" id="lock-batch" data-lock="batch"><label for="lock-batch">lock</label></span>
+      </div>
+    </div>
+    <p class="hint">throughput = batch_limit / interval, and must stay &ge; required_rate &times; safety. Lock the two you care about and the third is computed to the tightest value that satisfies that. Lock all three to just check values you already have &mdash; nothing solves, but the verdict still judges them. Parallelism from overlapping ticks is fine and self-caps at the scanner timeout.</p>
+    <div id="lockwarn" class="warn"></div>
+  </div>
+
+  <div class="panel">
+    <h2>verdict</h2>
+    <div id="verdict" class="verdict ok">&ndash;</div>
+    <div class="kv"><span>required_rate = &Sigma;(N/T)</span><span id="vReq">&ndash;</span></div>
+    <div class="kv"><span>required &times; safety</span><span id="vReqS">&ndash;</span></div>
+    <div class="kv"><span>throughput = batch / interval</span><span id="vThru">&ndash;</span></div>
+    <div class="kv"><span>headroom (throughput &minus; required)</span><span id="vHead">&ndash;</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>generated config (copy-paste into config.yaml)</h2>
+    <pre id="out">&ndash;</pre>
+    <div class="row" style="margin-top:10px">
+      <button id="copy">copy</button>
+      <span id="copied" class="hint"></span>
+    </div>
+  </div>
+
+<script>
+"use strict";
+// Default T values mirror base-config.yaml staleness_seconds.
+const DEFAULT_T = {
+  dangerously_open:604800, open:604800, oauth_open:604800, oauth:604800,
+  unknown:604800, closed:604800
+};
+const ORDER = ["dangerously_open","open","oauth_open","oauth","unknown","closed"];
+const $ = id => document.getElementById(id);
+const ceil = Math.ceil, floor = Math.floor;
+let DATA = null;     // last /counts payload
+let TVALS = {};      // bucket -> T (editable)
+
+// Lock state for the three solver params. A locked param is pinned; the single
+// unlocked one is solved from the other two. At most two may be locked.
+const LOCKED = { safety:false, interval:false, batch:false };
+// Among the UNLOCKED params, the most recently edited is the one we solve;
+// any other unlocked param keeps its entered value. Seed to interval so the
+// initial (zero-locks) state solves batch from interval+safety, as before.
+let LAST_EDITED = "interval";
+
+const PARAMS = ["safety","interval","batch"];
+
+function fmt(x, d=4){ return Number.isFinite(x) ? x.toFixed(d) : "\u2013"; }
+
+async function load(){
+  $("loaderr").textContent = "";
+  try{
+    const r = await fetch("calc/data", {headers:{"Accept":"application/json"}});
+    const j = await r.json();
+    if(!r.ok || j.error){ throw new Error(j.error || ("HTTP "+r.status)); }
+    DATA = j;
+    $("qpill").textContent = "queue: " + (j.queue_depth!=null ? j.queue_depth : "?") + " pending";
+    buildRows();
+    recompute();
+  }catch(e){
+    $("loaderr").textContent = "could not read /counts: " + e.message;
+  }
+}
+
+function buildRows(){
+  const tb = $("buckets").querySelector("tbody");
+  tb.innerHTML = "";
+  const buckets = (DATA && DATA.buckets) || {};
+  const names = ORDER.filter(b => b in buckets || b in DEFAULT_T);
+  for(const b of Object.keys(buckets)) if(!names.includes(b)) names.push(b);
+  for(const b of names){
+    const n = buckets[b] || 0;
+    if(!(b in TVALS)) TVALS[b] = DEFAULT_T[b] != null ? DEFAULT_T[b] : DEFAULT_T.unknown;
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>"+b+"</td>"+
+      '<td class="num">'+n+"</td>"+
+      '<td class="num"><input type="number" min="1" step="1" data-bucket="'+b+'" value="'+TVALS[b]+'"></td>'+
+      '<td class="num" data-rate>\u2013</td>';
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll("input[data-bucket]").forEach(inp=>{
+    inp.addEventListener("input", ()=>{
+      TVALS[inp.dataset.bucket] = Math.max(1, parseFloat(inp.value)||1);
+      recompute();
+    });
+  });
+}
+
+function requiredRate(){
+  if(!DATA) return 0;
+  const buckets = DATA.buckets || {};
+  let required = 0, sumN = 0;
+  const tb = $("buckets").querySelector("tbody");
+  tb.querySelectorAll("tr").forEach(tr=>{
+    const inp = tr.querySelector("input[data-bucket]");
+    const b = inp.dataset.bucket;
+    const n = buckets[b] || 0;
+    const T = Math.max(1, TVALS[b]);
+    const rate = n / T;
+    required += rate; sumN += n;
+    tr.querySelector("[data-rate]").textContent = fmt(rate, 6);
+  });
+  $("sumN").textContent = sumN;
+  $("reqRate").textContent = fmt(required, 6);
+  return required;
+}
+
+// Which single param do we solve? The unlocked param that was edited most
+// recently. If LAST_EDITED happens to be locked, fall back to any unlocked one.
+function fieldToSolve(){
+  if(!LOCKED[LAST_EDITED]) return LAST_EDITED;
+  return PARAMS.find(p => !LOCKED[p]) || null;
+}
+
+function applyFieldClasses(solved){
+  for(const p of PARAMS){
+    const fld = $("fld-"+p);
+    const line = fld.querySelector(".lockline");
+    fld.classList.toggle("locked", LOCKED[p]);
+    fld.classList.toggle("solved", p === solved);
+    line.classList.toggle("is-locked", LOCKED[p]);
+    // The solved field is computed, so it's read-only; locked + free-but-unsolved
+    // fields remain editable.
+    fld.querySelector("input[type=number]").readOnly = (p === solved);
+  }
+}
+
+function recompute(){
+  if(!DATA) return;
+
+  const lockCount = PARAMS.filter(p => LOCKED[p]).length;
+  $("lockwarn").textContent = lockCount >= 3
+    ? "all three locked \u2014 nothing is being solved; the verdict just judges the values as entered."
+    : "";
+
+  let safety   = Math.max(1, parseFloat($("safety").value)||1);
+  let interval = Math.max(1, parseInt($("interval").value)||1);
+  let batch    = Math.max(1, parseInt($("batch").value)||1);
+
+  const required = requiredRate();
+  const solved = (lockCount >= 3) ? null : fieldToSolve();
+
+  // target throughput we must meet/exceed = required * safety
+  // throughput = batch / interval
+  if(required > 0 && solved){
+    if(solved === "batch"){
+      batch = Math.max(1, ceil(required * safety * interval));
+      $("batch").value = batch;
+    }else if(solved === "interval"){
+      const target = required * safety;
+      interval = Math.max(1, floor(batch / target));
+      $("interval").value = interval;
+    }else if(solved === "safety"){
+      // safety = throughput / required ; pin to the achieved value.
+      const throughput = batch / interval;
+      safety = Math.max(1, throughput / required);
+      $("safety").value = fmt(safety, 4);
+    }
+  }
+
+  applyFieldClasses(solved);
+
+  const target = required * safety;
+  const throughput = batch / interval;
+  // Headroom is RAW slack over the bare required rate (not the safety-inflated
+  // target): the total scans/sec you have to spare. safety is the same slack
+  // expressed as a ratio (throughput / required), so neither is forced to zero
+  // when safety happens to be the solved field.
+  let headroom = throughput - required;
+  // Tolerance for float rounding when comparing throughput against the target:
+  // solving a field pins them to algebraically-equal values that can differ by
+  // a few ULPs, which would otherwise read as a spurious "falling behind".
+  const EPS = Math.max(target, throughput) * 1e-9 + 1e-12;
+  if(Math.abs(headroom) <= EPS) headroom = 0;
+
+  const v = $("verdict");
+  if(throughput >= target - EPS){
+    v.className = "verdict ok";
+    v.textContent = "\u2714 sustainable \u2014 throughput "+fmt(throughput,4)+"/s \u2265 required\u00d7safety "+fmt(target,4)+"/s";
+  }else{
+    v.className = "verdict bad";
+    v.textContent = "\u2718 falling behind \u2014 required\u00d7safety "+fmt(target,4)+"/s > throughput "+fmt(throughput,4)+"/s. unlock a field, shorten interval, raise batch, lower safety, or relax T.";
+  }
+  $("vReq").textContent  = fmt(required,6)+" /s";
+  $("vReqS").textContent = fmt(target,6)+" /s  (\u00d7"+fmt(safety,2)+")";
+  $("vThru").textContent = fmt(throughput,6)+" /s  ("+batch+" / "+interval+"s)";
+  $("vHead").textContent = fmt(headroom,6)+" /s";
+
+  const yaml =
+"rescan:\n"+
+"  interval_seconds: "+interval+"\n"+
+"  batch_limit: "+batch+"\n"+
+"  staleness_seconds:\n"+
+ORDER.filter(b=>b in TVALS).map(b=>"    "+b+": "+TVALS[b]).join("\n")+"\n";
+  $("out").textContent = yaml;
+}
+
+// --- lock checkbox handling --------------------------------------------------
+// Up to two locks leave exactly one field free to solve. Locking all three is
+// allowed too: nothing is solved, all three entered values stand as-is, and the
+// verdict still judges them honestly (recompute shows a warning in that case).
+function onLockToggle(ev){
+  const param = ev.target.dataset.lock;
+  if(ev.target.checked){
+    LOCKED[param] = true;
+  }else{
+    LOCKED[param] = false;
+    // A freshly-unlocked field becomes the thing we solve next.
+    LAST_EDITED = param;
+  }
+  recompute();
+}
+
+PARAMS.forEach(p=>{
+  $("lock-"+p).addEventListener("change", onLockToggle);
+  $(p).addEventListener("input", ()=>{
+    // Editing a field marks it as the most-recently-touched; if it's locked,
+    // its entered value simply stands and another unlocked field is solved.
+    if(!LOCKED[p]) LAST_EDITED = p;
+    recompute();
+  });
+});
+
+$("reload").addEventListener("click", load);
+$("copy").addEventListener("click", async ()=>{
+  try{ await navigator.clipboard.writeText($("out").textContent);
+       $("copied").textContent = "copied \u2714"; setTimeout(()=>$("copied").textContent="",1500);
+  }catch(e){ $("copied").textContent = "copy failed: "+e.message; }
+});
+load();
+</script>
+</body></html>
