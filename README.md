@@ -8,6 +8,9 @@ The main policy list for this project is [#cs-auto-open_reg:codestorm.net](https
 
 For general support and discussion feel free to visit in [#cs-projects:codestorm.net](https://matrix.to/#/#cs-projects:codestorm.net)
 
+
+This Project is developed with AI assistance.
+
 ## Contents
 
 - [How it works](#how-it-works)
