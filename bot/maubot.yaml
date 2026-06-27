@@ -1,6 +1,6 @@
 maubot: 0.5.0
 id: net.codestorm.csreg-scanner
-version: 0.1.8
+version: 0.1.9
 license: MIT
 modules:
   - csreg_scanner
@@ -13,7 +13,7 @@ webapp: true
 
 dependencies:
   - asyncpg>=0.29
-  - httpx>=0.28
+  - aiohttp>=3.9
   - dnspython>=2.6
 extra_files:
   - base-config.yaml

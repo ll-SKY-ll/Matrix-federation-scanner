@@ -29,11 +29,12 @@ raises.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import httpx
+import aiohttp
 
 from .resolver import (
     ServerResolver,
@@ -101,32 +102,33 @@ class FederationVersion:
 class FederationVersionProbe:
     """Resolves a server's federation endpoint and reads its version document.
 
-    A shared ``httpx.AsyncClient`` is injected for connection pooling, but note
-    the version probe issues its requests with TLS verification relaxed (see
-    module docstring); it does this per-request via the verify-disabled path
+    A shared ``aiohttp.ClientSession`` is injected for connection pooling, but
+    note the version probe issues its requests with TLS verification relaxed
+    (see module docstring); it does this via a dedicated verify-disabled session
     rather than mutating the shared client.
     """
 
-    def __init__(self, client: httpx.AsyncClient, log: logging.Logger) -> None:
+    def __init__(self, client: aiohttp.ClientSession, log: logging.Logger) -> None:
         self.log = log
         # The injected client carries the connection pool / headers we want, but
-        # we must issue the actual GET with verification disabled. httpx fixes
-        # verify at client construction, so we keep a dedicated verify=False
-        # client for the probe. It does not own the injected client's lifecycle.
+        # we must issue the actual GET with verification disabled. aiohttp fixes
+        # the TLS posture on the connector at construction, so we keep a
+        # dedicated session whose connector has ssl=False for the probe. It does
+        # not own the injected client's lifecycle. The session owns this private
+        # connector (connector_owner defaults True), so close() tears it down.
         self._resolver = ServerResolver(client)
-        self._verify_off = httpx.AsyncClient(
+        self._verify_off = aiohttp.ClientSession(
             headers={
                 "User-Agent": "csreg-scanner/1.0 (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
                 "Accept": "application/json",
             },
-            verify=False,  # relaxed: non-security-relevant reconnaissance only
-            follow_redirects=False,
+            connector=aiohttp.TCPConnector(ssl=False),  # relaxed: recon only
             trust_env=False,
         )
 
     async def aclose(self) -> None:
         """Close the dedicated verify-off client owned by this probe."""
-        await self._verify_off.aclose()
+        await self._verify_off.close()
 
     async def probe(self, scan_target: str) -> FederationVersion:
         """Resolve the federation endpoint for ``scan_target`` and read its
@@ -155,16 +157,16 @@ class FederationVersionProbe:
         headers = {"Host": target.host_header}
 
         try:
-            async with self._verify_off.stream(
-                "GET", url,
+            async with self._verify_off.get(
+                url,
                 headers=headers,
                 timeout=build_timeout(_VERSION_READ_TIMEOUT),
-                follow_redirects=False,
+                allow_redirects=False,
             ) as resp:
-                if resp.status_code != 200:
+                if resp.status != 200:
                     return FederationVersion.no_signal()
                 body = await read_json_capped(resp)
-        except httpx.HTTPError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             self.log.debug("fedversion probe(%s) http error: %s", scan_target, e)
             return FederationVersion.no_signal()
 

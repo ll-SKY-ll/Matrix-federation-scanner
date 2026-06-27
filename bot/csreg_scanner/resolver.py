@@ -16,18 +16,20 @@ server cannot stream unbounded data at the resolver. Failures, oversize bodies
 and malformed documents collapse to "no delegation"; the resolver never raises
 on network/parse errors.
 
-Dependencies: httpx, dnspython.
+Dependencies: aiohttp, dnspython.
 """
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-import httpx
+import aiohttp
+import yarl
 import dns.asyncresolver
 from dns.exception import DNSException
 
@@ -46,26 +48,33 @@ _CONNECT_TIMEOUT = 3.0
 _WELL_KNOWN_READ_TIMEOUT = 10.0
 
 
-def build_timeout(read_timeout: float) -> httpx.Timeout:
-    """An httpx.Timeout with a tight connect phase and a caller-set read phase.
+def build_timeout(read_timeout: float) -> aiohttp.ClientTimeout:
+    """An aiohttp.ClientTimeout with a tight connect phase and a caller-set read
+    phase.
 
     Splitting these is what bounds the dead-AAAA-then-fall-back-to-A case: the
     connect attempt to a dead address fails in ~_CONNECT_TIMEOUT rather than
-    consuming the whole per-request window.
+    consuming the whole per-request window. ``sock_connect`` bounds the TCP
+    connect to a single address and ``sock_read`` bounds inactivity between
+    reads; ``total`` is deliberately left unset so a legitimately slow-but-
+    progressing body isn't cut off mid-stream (the size cap, not a wall-clock,
+    is what stops a hostile slow-drip -- and the caller wraps the whole scan in
+    its own total-budget wait_for).
     """
-    return httpx.Timeout(read_timeout, connect=_CONNECT_TIMEOUT)
+    return aiohttp.ClientTimeout(sock_connect=_CONNECT_TIMEOUT, sock_read=read_timeout)
 
 
-async def read_json_capped(response: httpx.Response) -> Optional[Any]:
+async def read_json_capped(response: aiohttp.ClientResponse) -> Optional[Any]:
     """Read a streaming response body up to _MAX_BODY_BYTES and JSON-parse it.
 
     Returns the parsed object, or None if the body overflows the cap or is not
-    valid JSON. The caller MUST have opened ``response`` via ``client.stream``.
-    Never raises on overflow/parse; the connection is torn down by the
-    ``stream`` context manager on return.
+    valid JSON. The caller MUST be inside the ``async with session.get(...)``
+    context for ``response`` (the body is streamed off the live connection).
+    Never raises on overflow/parse; the connection is released by the
+    ``session.get`` context manager on return.
     """
     buf = bytearray()
-    async for chunk in response.aiter_bytes(_CHUNK):
+    async for chunk in response.content.iter_chunked(_CHUNK):
         buf.extend(chunk)
         if len(buf) > _MAX_BODY_BYTES:
             return None  # oversize -> treat as no usable response
@@ -204,14 +213,14 @@ def _host_header(host: str, port: Optional[int]) -> str:
 class ServerResolver:
     """Resolves a Matrix server name to a federation :class:`FederationTarget`.
 
-    :param client: shared ``httpx.AsyncClient`` used for well-known fetches.
+    :param client: shared ``aiohttp.ClientSession`` used for well-known fetches.
     :param dns_resolver: optional ``dns.asyncresolver.Resolver``; the default
         system resolver is used when not given.
     """
 
     def __init__(
         self,
-        client: httpx.AsyncClient,
+        client: aiohttp.ClientSession,
         dns_resolver: Optional[dns.asyncresolver.Resolver] = None,
     ) -> None:
         self.client = client
@@ -333,15 +342,15 @@ class ServerResolver:
         """
         url = f"https://{hostname}/.well-known/matrix/server"
         try:
-            async with self.client.stream(
-                "GET", url,
+            async with self.client.get(
+                url,
                 timeout=build_timeout(_WELL_KNOWN_READ_TIMEOUT),
-                follow_redirects=True,
+                allow_redirects=True,
             ) as resp:
-                if resp.status_code != 200:
+                if resp.status != 200:
                     return None
                 data = await read_json_capped(resp)
-        except httpx.HTTPError:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             return None
         if not isinstance(data, dict):
             return None
@@ -361,13 +370,13 @@ class ServerResolver:
     async def _query_srv(self, qname: str) -> Optional[tuple[str, int]]:
         try:
             answers = await self.dns.resolve(qname, "SRV")
-        except (
-            dns.asyncresolver.NXDOMAIN,
-            dns.asyncresolver.NoAnswer,
-            dns.asyncresolver.NoNameservers,
-        ):
-            return None
         except DNSException:
+            # NXDOMAIN / NoAnswer / NoNameservers (the normal "no SRV record"
+            # outcomes) and any other DNS-layer failure all subclass
+            # DNSException and mean the same thing here: no usable SRV answer ->
+            # fall through to the next resolution step. DNSException is the
+            # stable public base (dns.exception), so this avoids coupling to
+            # version-specific re-exports on dns.asyncresolver.
             return None
 
         records = list(answers)
@@ -407,7 +416,7 @@ class ClientResolver:
     .well-known/matrix/client.
     """
 
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(self, client: aiohttp.ClientSession) -> None:
         self.client = client
 
     async def resolve(self, server_name: str) -> ClientTarget:
@@ -425,15 +434,15 @@ class ClientResolver:
 
         url = f"https://{parsed.host}/.well-known/matrix/client"
         try:
-            async with self.client.stream(
-                "GET", url,
+            async with self.client.get(
+                url,
                 timeout=build_timeout(_WELL_KNOWN_READ_TIMEOUT),
-                follow_redirects=False,
+                allow_redirects=False,
             ) as resp:
-                if resp.status_code != 200:
+                if resp.status != 200:
                     return ClientTarget(None)
                 data = await read_json_capped(resp)
-        except httpx.HTTPError:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             return ClientTarget(None)
 
         if not isinstance(data, dict):
@@ -445,10 +454,14 @@ class ClientResolver:
         if not isinstance(base_url, str) or not base_url:
             return ClientTarget(None)
 
-        # Validate it parses as an http(s) URL; strip any trailing slash.
+        # Validate it parses as an http(s) URL; strip any trailing slash. yarl
+        # is lenient (it does not raise on a junk string -- it just yields an
+        # empty scheme/host), so the scheme/host check below is the real gate;
+        # the broad except is a belt-and-braces guard so any parse surprise
+        # still collapses to "no delegation" rather than raising.
         try:
-            parsed_url = httpx.URL(base_url)
-        except httpx.InvalidURL:
+            parsed_url = yarl.URL(base_url)
+        except Exception:  # noqa: BLE001 -- any parse failure -> no delegation
             return ClientTarget(None)
         if parsed_url.scheme not in ("http", "https") or not parsed_url.host:
             return ClientTarget(None)
@@ -461,7 +474,7 @@ class ClientResolver:
 
 async def resolve_all(
     server_name: str,
-    client: httpx.AsyncClient,
+    client: aiohttp.ClientSession,
     dns_resolver: Optional[dns.asyncresolver.Resolver] = None,
 ) -> ServerResolution:
     fed = await ServerResolver(client, dns_resolver).resolve(server_name)

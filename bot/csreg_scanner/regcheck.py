@@ -37,7 +37,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import httpx
+import aiohttp
+import yarl
 
 from .resolver import (
     ClientResolver,
@@ -166,13 +167,13 @@ def classify_register_body(body: object) -> Optional[str]:
 class RegistrationChecker:
     """Classifies one server's registration posture over the client-server API.
 
-    A shared ``httpx.AsyncClient`` is injected (connection pooling across scans).
-    The checker resolves the client base URL, then probes the legacy
+    A shared ``aiohttp.ClientSession`` is injected (connection pooling across
+    scans). The checker resolves the client base URL, then probes the legacy
     registration endpoint and the OAuth-delegation discovery endpoints, and
     applies the precedence ladder.
     """
 
-    def __init__(self, client: httpx.AsyncClient, log: logging.Logger) -> None:
+    def __init__(self, client: aiohttp.ClientSession, log: logging.Logger) -> None:
         self.client = client
         self.log = log
         self._client_resolver = ClientResolver(client)
@@ -223,11 +224,14 @@ class RegistrationChecker:
         if isinstance(well_known, dict):
             hs = well_known.get("m.homeserver")
             if isinstance(hs, dict) and isinstance(hs.get("base_url"), str) and hs["base_url"]:
+                # yarl is lenient (no raise on junk -> empty scheme/host), so
+                # the scheme/host check is the gate; the broad except is a guard
+                # so any parse surprise leaves base_url None (fall back below).
                 try:
-                    u = httpx.URL(hs["base_url"])
+                    u = yarl.URL(hs["base_url"])
                     if u.scheme in ("http", "https") and u.host:
                         base_url = str(u).rstrip("/")
-                except httpx.InvalidURL:
+                except Exception:  # noqa: BLE001 -- bad URL -> fall back to https://<host>
                     base_url = None
 
         if base_url is None:
@@ -247,15 +251,15 @@ class RegistrationChecker:
             return None
         url = f"https://{parsed.host}/.well-known/matrix/client"
         try:
-            async with self.client.stream(
-                "GET", url,
+            async with self.client.get(
+                url,
                 timeout=build_timeout(_PROBE_READ_TIMEOUT),
-                follow_redirects=False,
+                allow_redirects=False,
             ) as resp:
-                if resp.status_code != 200:
+                if resp.status != 200:
                     return None
                 return await read_json_capped(resp)
-        except httpx.HTTPError:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             return None
 
     # --- probes --------------------------------------------------------------
@@ -280,13 +284,13 @@ class RegistrationChecker:
         """
         url = f"{base_url}/_matrix/client/v3/register"
         try:
-            async with self.client.stream(
-                "POST", url,
+            async with self.client.post(
+                url,
                 json={},
                 timeout=build_timeout(_PROBE_READ_TIMEOUT),
-                follow_redirects=False,
+                allow_redirects=False,
             ) as resp:
-                status = resp.status_code
+                status = resp.status
                 if status not in (400, 401, 403):
                     # 404 / 5xx / 429 / 200-with-junk / anything else -> no
                     # trustworthy signal.
@@ -295,7 +299,7 @@ class RegistrationChecker:
                 # what distinguishes a real "registration disabled" from an
                 # unrelated forbidden (WAF / IP allowlist / flow rejection).
                 body = await read_json_capped(resp)
-        except httpx.HTTPError:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             return None
 
         if status == 401:
@@ -339,15 +343,15 @@ class RegistrationChecker:
             "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
         ):
             try:
-                async with self.client.stream(
-                    "GET", f"{base_url}{path}",
+                async with self.client.get(
+                    f"{base_url}{path}",
                     timeout=build_timeout(_PROBE_READ_TIMEOUT),
-                    follow_redirects=False,
+                    allow_redirects=False,
                 ) as resp:
-                    if resp.status_code != 200:
+                    if resp.status != 200:
                         continue
                     data = await read_json_capped(resp)
-            except httpx.HTTPError:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
             if isinstance(data, dict) and isinstance(data.get("issuer"), str) and data["issuer"]:
                 return True
@@ -375,7 +379,7 @@ class Scanner:
         self,
         timeout: float,
         log: logging.Logger,
-        client: Optional[httpx.AsyncClient] = None,
+        client: Optional[aiohttp.ClientSession] = None,
     ) -> None:
         self.timeout = timeout
         self.log = log
@@ -384,20 +388,20 @@ class Scanner:
         self._owns_client = client is None
         self.client = client or self._build_client()
         self._checker = RegistrationChecker(self.client, log)
-        # Federation version probe. It keeps its OWN verify-disabled httpx client
-        # internally (regcheck's client verifies TLS; the version probe must not),
-        # so it is always closed by aclose() regardless of who owns self.client.
+        # Federation version probe. It keeps its OWN verify-disabled aiohttp
+        # session internally (regcheck's client verifies TLS; the version probe
+        # must not), so it is always closed by aclose() regardless of who owns
+        # self.client.
         self._version = FederationVersionProbe(self.client, log)
 
     @staticmethod
-    def _build_client() -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+    def _build_client() -> aiohttp.ClientSession:
+        return aiohttp.ClientSession(
             headers={
                 "User-Agent": "csreg-scanner/1.0 (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
                 "Accept": "application/json",
             },
             timeout=build_timeout(_PROBE_READ_TIMEOUT),
-            follow_redirects=False,
             trust_env=False,  # no ambient proxy/env surprises in a scanner
         )
 
@@ -461,4 +465,4 @@ class Scanner:
         closed only when WE own it (the bot closes an injected shared client)."""
         await self._version.aclose()
         if self._owns_client:
-            await self.client.aclose()
+            await self.client.close()

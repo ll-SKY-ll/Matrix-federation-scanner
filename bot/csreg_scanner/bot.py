@@ -13,7 +13,6 @@ import pkgutil
 import time
 
 import aiohttp
-import httpx
 from aiohttp.web import Request, Response
 from maubot import Plugin
 from maubot.handlers import web
@@ -35,8 +34,8 @@ _EWMA_ALPHA = 0.2
 
 # -- Calculator UI --------------------------------------------------------------
 # The page itself lives in csreg_scanner/web/calc.html (shipped as an extra_file
-# and loaded via pkgutil so it works from inside the .mbp zip, same pattern as
-# the scanner binary). Self-contained: inline CSS/JS, system font stack, no
+# and loaded via pkgutil so it works from inside the .mbp zip). 
+# Self-contained: inline CSS/JS, system font stack, no
 # external assets (DSGVO). Duration-free model -- the calculator sizes the
 # rescan loop from counts + staleness targets only; measured scan duration never
 # enters the math:
@@ -114,17 +113,16 @@ class CSRegScanner(Plugin):
                 continue
             self._staleness[status] = int(secs)
 
-        # scanner: in-process registration checker over a shared httpx client.
+        # scanner: in-process registration checker over a shared aiohttp client.
         # The client is pooled across all scans and closed in stop(); the
         # Scanner does not own it (aclose() is a no-op for an injected client).
         # Timeouts: 3s connect (a dead address -- e.g. a stale AAAA on an
         # otherwise v4-reachable host -- fails fast and the loop falls through
         # to the next address), 8s read per request; the TOTAL per-target budget
         # is scanner.timeout_seconds, enforced inside Scanner.scan via wait_for.
-        self._http_client = httpx.AsyncClient(
+        self._http_client = aiohttp.ClientSession(
             headers={"User-Agent": "csreg-scanner/1.0 (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)", "Accept": "application/json"},
-            timeout=httpx.Timeout(8.0, connect=3.0),
-            follow_redirects=False,
+            timeout=aiohttp.ClientTimeout(sock_connect=3.0, sock_read=8.0),
             trust_env=False,
         )
         self.scanner = Scanner(
@@ -265,10 +263,10 @@ class CSRegScanner(Plugin):
         # stop()/config reload.
         if getattr(self, "scanner", None) is not None:
             await self.scanner.aclose()
-        # Close the shared httpx client last, after all in-flight scans that
+        # Close the shared aiohttp client last, after all in-flight scans that
         # borrow it have been cancelled and awaited above.
         if getattr(self, "_http_client", None) is not None:
-            await self._http_client.aclose()
+            await self._http_client.close()
 
     async def on_external_config_update(self) -> None:
         """maubot calls this when the instance config is edited. Nothing here is
