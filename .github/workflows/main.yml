@@ -1,0 +1,27 @@
+name: Release on tag
+
+on:
+  push:
+    tags:
+      - '*'          # or 'v*' to restrict
+
+permissions:
+  contents: write    # required to create releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .mbp
+        run: |
+          cd bot
+          zip -r "$GITHUB_WORKSPACE/cs_openreg.mbp" . -x '.git/*'
+
+      - name: Create release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cs_openreg.mbp
+          tag_name: ${{ github.ref_name }}
+          make_latest: true
