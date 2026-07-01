@@ -19,6 +19,7 @@ from maubot.handlers import web
 from mautrix.client import EventHandler
 from mautrix.types import EventType, RoomID, StateEvent
 from mautrix.util.async_db import UpgradeTable
+from mautrix.api import Method, Path
 
 from .config import Config
 from .db import DB, upgrade_table
@@ -31,6 +32,9 @@ from .util import validate_server_name
 
 # EWMA weight for the rolling average scan duration.
 _EWMA_ALPHA = 0.2
+
+# MSC4133 custom profile field advertising this plugin's running version.
+_VERSION_PROFILE_FIELD = "net.codestorm.federation-scanner.version"
 
 # -- Calculator UI --------------------------------------------------------------
 # The page itself lives in csreg_scanner/web/calc.html (shipped as an extra_file
@@ -229,8 +233,52 @@ class CSRegScanner(Plugin):
             self._tasks.append(asyncio.create_task(self._scan_loop()))
             self._tasks.append(asyncio.create_task(self._rescan_loop()))
 
+        # Advertise our version in the bot's Matrix profile (best-effort; a
+        # homeserver without MSC4133 custom-field support just rejects it).
+        await self._publish_version()
+
         self.log.info("csreg started: %d source(s), scanner=%s, metrics=%s",
                       len(self._sources), bool(self.scanner), bool(self.metrics))
+
+    async def _publish_version(self) -> None:
+        """Best-effort: advertise this plugin's version in the bot's own Matrix
+        profile via an MSC4133 custom profile field, so a list operator can see
+        which version each contributing bot is running just by looking at its
+        profile.
+
+        The field name follows the Common Namespaced Identifier Grammar the 
+        server enforces on custom fields.
+        """
+        # Version comes straight from maubot.yaml via the loader metadata --
+        # single source of truth, no duplicated constant to drift.
+        meta = getattr(self, "loader", None)
+        version = getattr(getattr(meta, "meta", None), "version", None)
+        if not version:
+            self.log.warning(
+                "could not determine plugin version; skipping profile publish",
+                extra={"csreg_alarm": "version_publish_no_version"},
+            )
+            return
+        version_str = str(version)
+        try:
+            await self.client.api.request(
+                Method.PUT,
+                Path.v3.profile[self.client.mxid][_VERSION_PROFILE_FIELD],
+                content={_VERSION_PROFILE_FIELD: version_str},
+            )
+        except Exception as e:  # noqa: BLE001 -- profile publish must never break startup
+            self.log.warning(
+                "could not publish version to profile (homeserver may lack "
+                "MSC4133 custom-field support): %s", e,
+                extra={"csreg_alarm": "version_publish_failed",
+                       "version": version_str},
+            )
+            return
+        self.log.info(
+            "published version %s to profile field %s",
+            version_str, _VERSION_PROFILE_FIELD,
+            extra={"csreg_event": "version_published", "version": version_str},
+        )
 
     async def stop(self) -> None:
         # Unregister the runtime-registered state handlers first, so a config
