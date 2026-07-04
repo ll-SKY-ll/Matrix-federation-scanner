@@ -91,10 +91,31 @@ class CSRegScanner(Plugin):
 
         self._tasks: list[asyncio.Task] = []
         self._avg_scan: float = 5.0  # seed; refined by EWMA (metrics only)
-        # Fire-and-forget scan tasks live here so the GC can't collect a running
-        # scan mid-flight (asyncio only weak-refs tasks), exceptions still get
-        # logged via a done-callback, and stop() can cancel anything in flight.
-        self._inflight: set[asyncio.Task] = set()
+        # In-flight scans, keyed by scan_target. One structure, three jobs:
+        #   (a) strong refs so the GC can't collect a running scan mid-flight
+        #       (asyncio only weak-refs tasks); exceptions still get logged via
+        #       the done-callback and stop() can cancel anything running;
+        #   (b) duplicate-launch guard: a target already being scanned is never
+        #       launched again. Without this, most_overdue keeps re-picking a
+        #       slow target every rescan tick until its terminal write lands
+        #       (scan budget >> rescan interval), turning the slowest servers
+        #       into N concurrent scans of themselves while burning the credit
+        #       genuinely-due servers should have gotten;
+        #   (c) admission control: len(self._inflight) vs _max_inflight is the
+        #       ONE concurrency limiter (see _max_inflight below).
+        self._inflight: dict[str, asyncio.Task] = {}
+
+        # Global in-flight ceiling. DERIVED from the two batch knobs the
+        # operator already tunes -- deliberately NOT a third config option, so
+        # concurrency can never be restricted in two different places.
+        # Launches beyond the ceiling are DEFERRED (skipped this tick, loudly 
+        # logged + metered, and retried on the next tick: queue rows stay 
+        # leased/reclaimable, rescan credit is retained).
+        self._max_inflight: int = max(
+            1,
+            int(self.config["queue.scan_batch_limit"])
+            + int(self.config["rescan.batch_limit"]),
+        )
 
         # Rescan rate-meter (leaky bucket). Each tick we add required_rate*interval
         # "credits" and launch floor(credit) most-overdue servers, so the long-run
@@ -124,8 +145,12 @@ class CSRegScanner(Plugin):
         # otherwise v4-reachable host -- fails fast and the loop falls through
         # to the next address), 8s read per request; the TOTAL per-target budget
         # is scanner.timeout_seconds, enforced inside Scanner.scan via wait_for.
+        # Connector: sized to exactly the admission ceiling. Every scan issues
+        # its probes as sequential awaits, so an in-flight scan holds at most
+        # ONE connection on this session at a time.
         self._http_client = aiohttp.ClientSession(
-            headers={"User-Agent": "csreg-scanner/1.0 (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)", "Accept": "application/json"},
+            connector=aiohttp.TCPConnector(limit=self._max_inflight),
+            headers={"User-Agent": "csreg-scanner (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)", "Accept": "application/json"},
             timeout=aiohttp.ClientTimeout(sock_connect=3.0, sock_read=8.0),
             trust_env=False,
         )
@@ -133,6 +158,7 @@ class CSRegScanner(Plugin):
             float(self.config["scanner.timeout_seconds"]),
             self.log,
             client=self._http_client,
+            pool_limit=self._max_inflight,
         )
 
         # policy governance
@@ -293,7 +319,7 @@ class CSRegScanner(Plugin):
         for t in getattr(self, "_tasks", []):
             t.cancel()
         # Cancel any fire-and-forget scans still running from the last tick.
-        inflight = list(getattr(self, "_inflight", ()))
+        inflight = list(getattr(self, "_inflight", {}).values())
         for t in inflight:
             t.cancel()
         pending = list(getattr(self, "_tasks", [])) + inflight
@@ -323,14 +349,33 @@ class CSRegScanner(Plugin):
         teardown + rebuild: stop() cancels every loop and in-flight scan, closes
         the pg source and the metrics listener; start() re-reads the YAML and
         rebinds everything. Brief scan interruption + metrics-socket rebind is
-        the accepted cost. Guarded so an exception can't leave a half-running
-        instance with orphaned loops."""
+        the accepted cost. BOTH halves are guarded: an exception in stop() must
+        not block the rebuild, and an exception in start() (bad YAML value, a
+        metrics port grabbed by another process, ...) must not leave a silently
+        half-built instance -- on start() failure we tear down whatever it
+        managed to build (stop() is getattr-guarded everywhere, so it is safe
+        against partial state) and leave the plugin DOWN with a loud structured
+        alarm, rather than down with nothing but a swallowed traceback."""
         self.log.info("config changed; restarting plugin runtime")
         try:
             await self.stop()
         except Exception as e:  # noqa: BLE001
             self.log.warning("error during config-reload stop(): %s", e)
-        await self.start()
+        try:
+            await self.start()
+        except Exception as e:  # noqa: BLE001
+            self.log.error(
+                "config reload failed in start(); plugin is NOT running until "
+                "the next successful config edit or maubot restart: %s", e,
+                exc_info=True,
+                extra={"csreg_alarm": "config_reload_failed", "error": str(e)},
+            )
+            # Best-effort teardown of whatever the failed start() half-built
+            # (loops, sockets, sessions), so nothing orphaned keeps running.
+            try:
+                await self.stop()
+            except Exception as e2:  # noqa: BLE001
+                self.log.warning("cleanup after failed start() also failed: %s", e2)
 
     # --- ingress -------------------------------------------------------------
 
@@ -512,16 +557,30 @@ class CSRegScanner(Plugin):
     async def _scan_loop(self) -> None:
         interval = int(self.config["queue.scan_interval_seconds"])
         limit = int(self.config["queue.scan_batch_limit"])
-        # Lease window for a claimed queue row: the scan can't still be alive
-        # past the scanner timeout, so +1s of slack is enough for the terminal
-        # write to land. A crashed/cancelled scan's row frees itself once this
-        # lease expires (see db.pending / db.record_scan).
-        lease_seconds = int(float(self.config["scanner.timeout_seconds"])) + 1
+        # Lease window for a claimed queue row. The scan itself can't run past
+        # the scanner timeout, but the lease clock starts at the CLAIM, and
+        # under load there is real time between claim and task start (event-
+        # loop lag with hundreds of tasks) plus the terminal DB write at the
+        # end -- +1s of slack was tight enough that a delayed terminal write
+        # could expire the lease under a still-running scan. 30s of slack
+        # costs nothing in the crash-recovery case (the only case the lease is
+        # for: a premature expiry is additionally harmless now, because the
+        # in-flight guard turns a re-claimed running target into a skip, never
+        # a duplicate launch).
+        lease_seconds = int(float(self.config["scanner.timeout_seconds"])) + 30
         while True:
             try:
-                pending = await self.db.pending(limit, lease_seconds)
-                for target in pending:
-                    self._launch_scan(target, "scan")
+                # Admission gate: only claim as many rows as there are free
+                # in-flight slots. Unclaimed rows keep leased_until NULL and
+                # are picked up by a later tick -- deferral, not queuing, so
+                # nothing waits with its lease burning invisibly.
+                slots = self._max_inflight - len(self._inflight)
+                if slots <= 0:
+                    self._admission_deferred("scan")
+                else:
+                    pending = await self.db.pending(min(limit, slots), lease_seconds)
+                    for target in pending:
+                        self._launch_scan(target, "scan")
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -547,15 +606,33 @@ class CSRegScanner(Plugin):
                 self._rescan_credit = min(
                     float(limit), self._rescan_credit + required * interval
                 )
-                take = min(int(self._rescan_credit), limit)
+                want = min(int(self._rescan_credit), limit)
+                # Admission gate: cap this tick's take by free in-flight slots.
+                # Withheld credit is NOT forfeited (only launched work spends
+                # credit, below), so deferred demand carries to the next tick.
+                slots = self._max_inflight - len(self._inflight)
+                take = min(want, max(slots, 0))
+                if want >= 1 and take < want:
+                    self._admission_deferred("rescan", deferred=want - take)
                 if take >= 1:
-                    due = await self.db.most_overdue(self._staleness, take)
+                    # Over-fetch by the in-flight count: a target already being
+                    # scanned is skipped by _launch_scan (duplicate guard), and
+                    # without the over-fetch those skips would mask genuinely-
+                    # due rows ranked just below them in the staleness order.
+                    due = await self.db.most_overdue(
+                        self._staleness, take + len(self._inflight)
+                    )
+                    launched = 0
                     for target in due:
-                        self._launch_scan(target, "rescan")
-                    # Spend credit only for work actually launched: if fewer were
-                    # overdue than authorized, keep the rest so newly-due servers
-                    # are picked up promptly rather than forfeiting the budget.
-                    self._rescan_credit -= len(due)
+                        if launched >= take:
+                            break
+                        if self._launch_scan(target, "rescan"):
+                            launched += 1
+                    # Spend credit only for scans actually LAUNCHED: skipped
+                    # duplicates and shorter-than-authorized overdue lists keep
+                    # their budget so newly-due servers are picked up promptly
+                    # rather than forfeiting it.
+                    self._rescan_credit -= launched
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -564,19 +641,31 @@ class CSRegScanner(Plugin):
 
     # --- shared scan unit ----------------------------------------------------
 
-    def _launch_scan(self, scan_target: str, kind: str) -> None:
-        """Fire a scan as a tracked background task. The tick does NOT await it:
-        each tick launches its batch and returns to its fixed-rate clock, so the
-        batch_limit is the per-tick concurrency and the scanner timeout is the
-        natural ceiling on simultaneously-running scans. Tracked in _inflight so
-        the task can't be GC'd mid-run; the done-callback logs failures and
-        unregisters it."""
-        task = asyncio.create_task(self._scan_one(scan_target))
-        self._inflight.add(task)
-        task.add_done_callback(lambda t: self._scan_done(t, kind))
+    def _launch_scan(self, scan_target: str, kind: str) -> bool:
+        """Fire a scan as a tracked background task, unless one for this exact
+        target is already in flight. The tick does NOT await it: each tick
+        launches its admitted batch and returns to its fixed-rate clock; total
+        concurrency is bounded by _max_inflight via the admission gates in the
+        two tick loops. Tracked in _inflight (keyed by target) so the task
+        can't be GC'd mid-run AND so the same target can never run twice
+        concurrently; the done-callback logs failures and unregisters it.
 
-    def _scan_done(self, task: asyncio.Task, kind: str) -> None:
-        self._inflight.discard(task)
+        Returns True when a task was launched, False when the target was
+        skipped because it is already being scanned -- callers use this to
+        account only for real launches (rescan credit)."""
+        if scan_target in self._inflight:
+            # Already running: a rescan tick re-picked a slow target whose
+            # terminal write hasn't landed yet, or a queue lease expired under
+            # a still-running scan. Skip -- the running scan's terminal write
+            # covers this demand.
+            return False
+        task = asyncio.create_task(self._scan_one(scan_target))
+        self._inflight[scan_target] = task
+        task.add_done_callback(lambda t: self._scan_done(t, kind, scan_target))
+        return True
+
+    def _scan_done(self, task: asyncio.Task, kind: str, scan_target: str) -> None:
+        self._inflight.pop(scan_target, None)
         if task.cancelled():
             return
         exc = task.exception()
@@ -585,6 +674,30 @@ class CSRegScanner(Plugin):
                 "%s task raised: %s", kind, exc,
                 extra={"csreg_alarm": f"{kind}_task_error"},
             )
+
+    def _admission_deferred(self, kind: str, deferred: int | None = None) -> None:
+        """Loud, structured signal that the in-flight ceiling deferred launches
+        this tick. Deferral is designed behavior -- the work is retried on the
+        next tick (queue rows stay claimable, rescan credit is retained) -- but
+        it must never be invisible: persistent saturation means scans complete
+        slower than launch demand, and the operator should learn that from this
+        alarm (and the csreg_scans_inflight gauge), not from mysteriously stale
+        buckets. Fires at most once per tick per loop."""
+        extra = {
+            "csreg_alarm": "scan_admission_deferred",
+            "kind": kind,
+            "inflight": len(self._inflight),
+            "ceiling": self._max_inflight,
+            "hint": "scans complete slower than launch demand; if persistent, "
+                    "investigate slow/dead targets or raise the batch limits "
+                    "(the ceiling is queue.scan_batch_limit + rescan.batch_limit)",
+        }
+        if deferred is not None:
+            extra["deferred"] = deferred
+        self.log.warning(
+            "%s launches deferred: in-flight scans at ceiling (%d/%d)",
+            kind, len(self._inflight), self._max_inflight, extra=extra,
+        )
 
     async def _scan_one(self, scan_target: str) -> None:
         t0 = time.monotonic()
@@ -706,7 +819,17 @@ class CSRegScanner(Plugin):
         buckets = await self.db.bucket_counts()
         total = sum(buckets.values())
         queue_depth = await self.db.queue_depth()
-        total_scans = await self.db.total_scans()
+        initial_scans, rescans, total_scans = await self.db.scan_totals()
+        # Nominal queue-drain throughput = scan_batch_limit / scan_interval.
+        # Pure config (a flat reference line between reloads), NOT a guarantee:
+        # the admission ceiling is shared with the rescan path, so under
+        # saturation the ACTUAL initial rate (rate() over the initial type of
+        # the by-type counter) sits below this even with a full queue -- that
+        # gap, alongside a nonzero queue depth, is the queue-path saturation
+        # signal (paired with the scan_admission_deferred alarm saying why).
+        q_interval = int(self.config["queue.scan_interval_seconds"])
+        q_batch = int(self.config["queue.scan_batch_limit"])
+        initial_achievable = q_batch / q_interval if q_interval > 0 else 0.0
         required, achievable = self._rates(buckets)
         fed_versions = await self.db.fed_version_counts()
         return {
@@ -714,11 +837,33 @@ class CSRegScanner(Plugin):
             "buckets": buckets,
             "total": total,
             "total_scans": total_scans,
+            "initial_scans": initial_scans,
+            "rescans": rescans,
             "queue_depth": queue_depth,
             "active_rules": self.policy.active_rules(),
             "halted": self.policy.halted,
             "avg_scan": self._avg_scan,
+            "inflight": len(self._inflight),
+            "inflight_ceiling": self._max_inflight,
             "required_rate": required,
             "achievable_rate": achievable,
+            "initial_achievable_rate": initial_achievable,
+            # Config-as-metric block: static between reloads, exposed so
+            # dashboards/alerts can reference the settings (threshold lines,
+            # joins) instead of hardcoding them. Staleness comes from the
+            # validated map (self._staleness), not raw config, so the exposed
+            # values are the ones the rescan loop actually uses.
+            "staleness": dict(self._staleness),
+            "loop_config": {
+                "initial": {
+                    "interval": q_interval,
+                    "batch_limit": q_batch,
+                },
+                "rescan": {
+                    "interval": int(self.config["rescan.interval_seconds"]),
+                    "batch_limit": int(self.config["rescan.batch_limit"]),
+                },
+            },
+            "scan_timeout": float(self.config["scanner.timeout_seconds"]),
             "fed_versions": fed_versions,
         }

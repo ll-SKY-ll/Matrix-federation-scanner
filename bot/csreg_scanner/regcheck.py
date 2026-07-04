@@ -380,6 +380,7 @@ class Scanner:
         timeout: float,
         log: logging.Logger,
         client: Optional[aiohttp.ClientSession] = None,
+        pool_limit: Optional[int] = None,
     ) -> None:
         self.timeout = timeout
         self.log = log
@@ -391,14 +392,16 @@ class Scanner:
         # Federation version probe. It keeps its OWN verify-disabled aiohttp
         # session internally (regcheck's client verifies TLS; the version probe
         # must not), so it is always closed by aclose() regardless of who owns
-        # self.client.
-        self._version = FederationVersionProbe(self.client, log)
+        # self.client. pool_limit (the bot's scan-admission ceiling) is threaded
+        # through so the probe's private connection pool is sized to the same
+        # ceiling and can never become a second, silent concurrency limiter.
+        self._version = FederationVersionProbe(self.client, log, pool_limit=pool_limit)
 
     @staticmethod
     def _build_client() -> aiohttp.ClientSession:
         return aiohttp.ClientSession(
             headers={
-                "User-Agent": "csreg-scanner/1.0 (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
+                "User-Agent": "csreg-scanner (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
                 "Accept": "application/json",
             },
             timeout=build_timeout(_PROBE_READ_TIMEOUT),

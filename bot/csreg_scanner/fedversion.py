@@ -108,7 +108,12 @@ class FederationVersionProbe:
     rather than mutating the shared client.
     """
 
-    def __init__(self, client: aiohttp.ClientSession, log: logging.Logger) -> None:
+    def __init__(
+        self,
+        client: aiohttp.ClientSession,
+        log: logging.Logger,
+        pool_limit: Optional[int] = None,
+    ) -> None:
         self.log = log
         # The injected client carries the connection pool / headers we want, but
         # we must issue the actual GET with verification disabled. aiohttp fixes
@@ -116,13 +121,24 @@ class FederationVersionProbe:
         # dedicated session whose connector has ssl=False for the probe. It does
         # not own the injected client's lifecycle. The session owns this private
         # connector (connector_owner defaults True), so close() tears it down.
+        #
+        # pool_limit: the caller's scan-admission ceiling. Each in-flight scan
+        # issues at most one version-probe request at a time, so a connector
+        # limit equal to that ceiling can never make a probe wait for a pool
+        # slot -- the admission gate upstream stays the single (loud) limiter
+        # and this pool cannot silently queue beneath it. When not given
+        # (standalone/CLI use, no admission gate) aiohttp's own default of 100
+        # is kept.
         self._resolver = ServerResolver(client)
         self._verify_off = aiohttp.ClientSession(
             headers={
-                "User-Agent": "csreg-scanner/1.0 (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
+                "User-Agent": "csreg-scanner (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
                 "Accept": "application/json",
             },
-            connector=aiohttp.TCPConnector(ssl=False),  # relaxed: recon only
+            connector=aiohttp.TCPConnector(
+                ssl=False,  # relaxed: recon only (see module docstring)
+                limit=pool_limit if pool_limit is not None else 100,
+            ),
             trust_env=False,
         )
 

@@ -548,11 +548,32 @@ class DB:
         )
         return [(r["name"], r["version"], int(r["n"])) for r in rows]
 
-    async def total_scans(self) -> int:
-        """Cumulative count of every scan execution (incl. rescans), summed from
-        the per-target scan_count. Monotonic across restarts since it's derived
-        from persisted state -- the right source for a Prometheus counter.
-        COALESCE so an empty table yields 0, not NULL."""
-        return int(
-            await self._db.fetchval("SELECT COALESCE(SUM(scan_count), 0) FROM scanned")
+    async def scan_totals(self) -> tuple[int, int, int]:
+        """Cumulative scan-execution totals as (initial, rescans, total).
+
+        Derived from persisted state in ONE aggregate pass, so all three are
+        monotonic across restarts -- the right source for Prometheus counters.
+        No schema change and no runtime bookkeeping is needed, because the data
+        model already encodes the split:
+
+          * a row only enters `scanned` via its first-ever scan, and enqueue
+            skips anything already in `scanned` while rescan only picks rows
+            already in `scanned` -- so the FIRST scan of every target is, by
+            construction, the queue path. COUNT(*) is therefore the lifetime
+            initial-scan total.
+          * every subsequent increment of scan_count is a rescan, so
+            SUM(scan_count) - COUNT(*) is the lifetime rescan total.
+
+        This ground-truth (first-vs-subsequent) definition is deliberately used
+        instead of counting by launch-path label: a lease-expiry re-launch
+        carries the "scan" label but is semantically a repeat, and an in-memory
+        per-kind counter would reset on restart. COALESCE so an empty table
+        yields zeros, not NULL.
+        """
+        row = await self._db.fetchrow(
+            "SELECT COUNT(*) AS targets, COALESCE(SUM(scan_count), 0) AS scans "
+            "FROM scanned"
         )
+        targets = int(row["targets"])
+        scans = int(row["scans"])
+        return targets, max(scans - targets, 0), scans

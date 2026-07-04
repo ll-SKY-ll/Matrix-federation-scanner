@@ -140,6 +140,25 @@ class MetricsServer:
         out.append("# TYPE csreg_scans_total counter")
         out.append(f"csreg_scans_total {snap['total_scans']}")
 
+        # The same total split by kind, so the two scan systems can be graphed
+        # (and capacity-compared) independently. The aggregate above mixes both
+        # paths, so rate(csreg_scans_total) can legitimately exceed
+        # csreg_rescan_achievable_scans_per_second whenever the queue path is
+        # also scanning -- which reads like a violated capacity limit but isn't.
+        # Compare rate(csreg_scans_by_type_total{kind="rescan"}) against the
+        # rescan achievable/required gauges instead; kind="initial" is the
+        # queue-drain (first-ever scan of a target). The kinds are derived from
+        # persisted ground truth (first-vs-subsequent scan, see db.scan_totals),
+        # are monotonic across restarts, and sum to csreg_scans_total.
+        out.append(
+            "# HELP csreg_scans_by_type_total Cumulative scan executions by kind "
+            "(initial = first-ever scan via the queue, rescan = every "
+            "subsequent scan; kinds sum to csreg_scans_total)"
+        )
+        out.append("# TYPE csreg_scans_by_type_total counter")
+        out.append(f'csreg_scans_by_type_total{{kind="initial"}} {snap["initial_scans"]}')
+        out.append(f'csreg_scans_by_type_total{{kind="rescan"}} {snap["rescans"]}')
+
         # Per-bucket counts.
         out.append(
             "# HELP matrix_server_registration_bucket_count Scanned servers per "
@@ -167,6 +186,15 @@ class MetricsServer:
         # Operational gauges.
         _gauge(out, "csreg_scan_queue_depth", "Pending domains in the scan queue",
                snap["queue_depth"])
+        # Admission-control visibility: inflight pinned at the ceiling is the
+        # "launches are being deferred" signal (paired with the
+        # scan_admission_deferred log alarm) -- saturation is a designed state,
+        # but never a silent one.
+        _gauge(out, "csreg_scans_inflight", "Scan tasks currently in flight",
+               snap["inflight"])
+        _gauge(out, "csreg_scans_inflight_ceiling",
+               "In-flight admission ceiling (queue + rescan batch limits)",
+               snap["inflight_ceiling"])
         _gauge(out, "csreg_policy_rules_active", "Active policy rules in local fold",
                snap["active_rules"])
         _gauge(out, "csreg_halted", "1 if policy writes are halted (fail-closed)",
@@ -180,6 +208,70 @@ class MetricsServer:
         _gauge(out, "csreg_rescan_achievable_scans_per_second",
                "Configured rescan throughput = rescan.batch_limit / interval",
                round(snap["achievable_rate"], 6))
+        # Queue-path (initial scan) nominal drain rate. There is no "required"
+        # counterpart here -- ingress demand is bursty, not a steady-state rate
+        # -- so this is a reference line, not half of a saturation predicate.
+        # Read it two ways: csreg_scan_queue_depth / this = drain ETA for an
+        # import; and actual rate(csreg_scans_by_type_total{kind="initial"})
+        # sitting below this while queue_depth > 0 = the queue path is being
+        # squeezed (shared admission ceiling; see scan_admission_deferred).
+        _gauge(out, "csreg_initial_achievable_scans_per_second",
+               "Configured queue-drain throughput = queue.scan_batch_limit / "
+               "queue.scan_interval_seconds (nominal; shared admission ceiling "
+               "applies)",
+               round(snap["initial_achievable_rate"], 6))
+
+        # --- config-as-metric -------------------------------------------------
+        # Operator settings exposed as gauges: flat lines between config
+        # reloads, here so dashboards can draw threshold/reference lines and
+        # alerts can compare against settings without hardcoding a copy that
+        # silently drifts from the real config. Consistency checks these
+        # enable: bucket_size / staleness summed over buckets reconciles with
+        # csreg_rescan_required_scans_per_second, and
+        # sum(csreg_scan_batch_limit) == csreg_scans_inflight_ceiling.
+        # Staleness values are the VALIDATED map the rescan loop actually uses
+        # (unknown statuses in raw config are dropped at startup), and the
+        # status label matches matrix_server_registration_status for PromQL
+        # joins. Queue label values match the by-type counter: initial = the
+        # new-scan queue drain, rescan = the staleness-driven loop.
+        stale = snap["staleness"]
+        if stale:
+            out.append(
+                "# HELP csreg_rescan_staleness_seconds Configured per-status max "
+                "staleness T; a bucket's rescan demand is bucket_size / T"
+            )
+            out.append("# TYPE csreg_rescan_staleness_seconds gauge")
+            for status in sorted(stale):
+                out.append(
+                    f'csreg_rescan_staleness_seconds{{status="{status}"}} '
+                    f"{int(stale[status])}"
+                )
+        loops = snap["loop_config"]
+        out.append(
+            "# HELP csreg_scan_interval_seconds Configured tick interval per "
+            "scan loop"
+        )
+        out.append("# TYPE csreg_scan_interval_seconds gauge")
+        for q in ("initial", "rescan"):
+            out.append(
+                f'csreg_scan_interval_seconds{{queue="{q}"}} '
+                f"{int(loops[q]['interval'])}"
+            )
+        out.append(
+            "# HELP csreg_scan_batch_limit Configured max launches per tick per "
+            "scan loop (their sum is the in-flight admission ceiling)"
+        )
+        out.append("# TYPE csreg_scan_batch_limit gauge")
+        for q in ("initial", "rescan"):
+            out.append(
+                f'csreg_scan_batch_limit{{queue="{q}"}} '
+                f"{int(loops[q]['batch_limit'])}"
+            )
+        _gauge(out, "csreg_scan_timeout_seconds",
+               "Configured total per-target scan budget "
+               "(scanner.timeout_seconds); interprets the in-flight gauge: a "
+               "scan may legally hold a slot this long",
+               round(snap["scan_timeout"], 3))
 
         return "\n".join(out) + "\n"
 
