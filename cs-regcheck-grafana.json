@@ -3,7 +3,7 @@
   "kind": "Dashboard",
   "metadata": {
     "name": "ad4brvd",
-    "generation": 22,
+    "generation": 31,
     "creationTimestamp": "2026-06-13T15:24:50Z",
     "labels": {},
     "annotations": {}
@@ -102,7 +102,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "bargauge",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "displayMode": "gradient",
@@ -170,9 +170,9 @@
                       "group": "prometheus",
                       "version": "v0",
                       "spec": {
-                        "editorMode": "builder",
+                        "editorMode": "code",
                         "exemplar": false,
-                        "expr": "sum by(name) (matrix_server_federation_version_count{job=\"$job\", name=~\"$server_fam\"})",
+                        "expr": "(sum by(name) (${server_reachability:raw}))",
                         "format": "time_series",
                         "instant": true,
                         "legendFormat": "{{name}}",
@@ -195,7 +195,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "piechart",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "displayLabels": [
@@ -334,7 +334,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "annotations": {
@@ -542,7 +542,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "colorMode": "background",
@@ -624,7 +624,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "gauge",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "barShape": "flat",
@@ -749,7 +749,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "annotations": {
@@ -1000,7 +1000,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "cellHeight": "sm",
@@ -1191,7 +1191,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "cellHeight": "sm",
@@ -1287,7 +1287,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "colorMode": "none",
@@ -1333,7 +1333,7 @@
         "kind": "Panel",
         "spec": {
           "id": 2,
-          "title": "Registration status over time",
+          "title": "Registration status over time & servers publishing support records",
           "description": "",
           "links": [],
           "data": {
@@ -1361,6 +1361,28 @@
                     "refId": "A",
                     "hidden": false
                   }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "builder",
+                        "expr": "matrix_server_support_info_count{job=\"$job\"}",
+                        "legendFormat": "servers with published support info",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1",
+                        "grafana.app/export-datasource-name": "Prometheus"
+                      }
+                    },
+                    "refId": "B",
+                    "hidden": false
+                  }
                 }
               ],
               "transformations": [],
@@ -1370,7 +1392,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "annotations": {
@@ -1427,7 +1449,7 @@
                     },
                     "insertNulls": false,
                     "lineInterpolation": "linear",
-                    "lineWidth": 1,
+                    "lineWidth": 2,
                     "pointSize": 5,
                     "scaleDistribution": {
                       "type": "linear"
@@ -1444,7 +1466,55 @@
                     }
                   }
                 },
-                "overrides": []
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byFrameRefID",
+                      "options": "B"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.axisPlacement",
+                        "value": "hidden"
+                      },
+                      {
+                        "id": "custom.drawStyle",
+                        "value": "line"
+                      },
+                      {
+                        "id": "custom.barAlignment",
+                        "value": 0
+                      },
+                      {
+                        "id": "custom.lineWidth",
+                        "value": 1
+                      },
+                      {
+                        "id": "custom.fillOpacity",
+                        "value": 9
+                      },
+                      {
+                        "id": "custom.gradientMode",
+                        "value": "hue"
+                      },
+                      {
+                        "id": "color",
+                        "value": {
+                          "fixedColor": "#a214e0",
+                          "mode": "fixed"
+                        }
+                      },
+                      {
+                        "id": "custom.hideFrom",
+                        "value": {
+                          "legend": false,
+                          "tooltip": false,
+                          "viz": false
+                        }
+                      }
+                    ]
+                  }
+                ]
               }
             }
           },
@@ -1515,7 +1585,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "annotations": {
@@ -1683,7 +1753,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "colorMode": "value",
@@ -1765,7 +1835,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "colorMode": "background",
@@ -1847,7 +1917,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "annotations": {
@@ -1990,7 +2060,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "cellHeight": "lg",
@@ -2076,8 +2146,8 @@
                       "group": "prometheus",
                       "version": "v0",
                       "spec": {
-                        "editorMode": "builder",
-                        "expr": "matrix_server_federation_version_count{job=\"$job\", name=~\"$server_fam\"}",
+                        "editorMode": "code",
+                        "expr": "${server_reachability:raw}",
                         "legendFormat": "{{name}} {{version}}",
                         "range": true
                       },
@@ -2098,7 +2168,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "annotations": {
@@ -2198,8 +2268,8 @@
                       "group": "prometheus",
                       "version": "v0",
                       "spec": {
-                        "editorMode": "builder",
-                        "expr": "sum by(name) (matrix_server_federation_version_count{job=\"$job\", name=~\"$server_fam\"})",
+                        "editorMode": "code",
+                        "expr": "sum by(name) (${server_reachability:raw})",
                         "legendFormat": "{{name}} {{version}}",
                         "range": true
                       },
@@ -2220,7 +2290,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.0",
+            "version": "13.1.1",
             "spec": {
               "options": {
                 "annotations": {
@@ -2521,7 +2591,7 @@
             "kind": "RowsLayoutRow",
             "spec": {
               "title": "Version stats breakdown",
-              "collapse": false,
+              "collapse": true,
               "layout": {
                 "kind": "GridLayout",
                 "spec": {
@@ -2824,6 +2894,25 @@
           "multi": false,
           "includeAll": false,
           "allowCustomValue": false
+        }
+      },
+      {
+        "kind": "CustomVariable",
+        "spec": {
+          "name": "server_reachability",
+          "query": "all : matrix_server_federation_version_count{job=\"$job\"\\, name=~\"$server_fam\"}, only online : matrix_server_federation_version_reachable_count{job=\"$job\"\\, name=~\"$server_fam\"}, only offline : (matrix_server_federation_version_count{job=\"$job\"\\, name=~\"$server_fam\"}) - (matrix_server_federation_version_reachable_count{job=\"$job\"\\, name=~\"$server_fam\"})",
+          "current": {
+            "text": "all",
+            "value": "matrix_server_federation_version_count{job=\"maubot_csreg\", name=~\".*\"}"
+          },
+          "options": [],
+          "multi": false,
+          "includeAll": false,
+          "label": "Server reachability",
+          "hide": "dontHide",
+          "skipUrlSync": false,
+          "allowCustomValue": false,
+          "valuesFormat": "csv"
         }
       }
     ],
