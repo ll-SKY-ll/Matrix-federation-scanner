@@ -47,6 +47,7 @@ from .resolver import (
     read_json_capped,
 )
 from .fedversion import FederationVersion, FederationVersionProbe
+from .supportinfo import SupportInfo, SupportInfoProbe
 
 
 # --- status constants (must exist in taxonomy.KNOWN_STATUSES) ---------------- #
@@ -367,10 +368,12 @@ class Scanner:
     """In-process registration scanner.
 
     Preserves the prior interface shape: ``async scan(scan_target)`` -- but now
-    returns ``(ScanResult, FederationVersion)``: registration classification PLUS
-    a federation /version probe result. ``timeout`` is the TOTAL budget for the
-    whole scan of one target; classification runs first under that budget, then
-    the version probe consumes whatever wall-clock REMAINS of it (see ``scan``).
+    returns ``(ScanResult, FederationVersion, SupportInfo)``: registration
+    classification PLUS a federation /version probe result PLUS the support
+    well-known document. ``timeout`` is the TOTAL budget for the whole scan of
+    one target; classification runs first under that budget, then the version
+    probe and support fetch consume whatever wall-clock REMAINS of it, in that
+    order (see ``scan``).
     The bot owns concurrency (it fans out scans and bounds them by batch size),
     so this handles a single target per call.
     """
@@ -381,6 +384,7 @@ class Scanner:
         log: logging.Logger,
         client: Optional[aiohttp.ClientSession] = None,
         pool_limit: Optional[int] = None,
+        fetch_support: bool = True,
     ) -> None:
         self.timeout = timeout
         self.log = log
@@ -396,6 +400,12 @@ class Scanner:
         # through so the probe's private connection pool is sized to the same
         # ceiling and can never become a second, silent concurrency limiter.
         self._version = FederationVersionProbe(self.client, log, pool_limit=pool_limit)
+        # Support well-known fetcher (config-gated via fetch_support). Plain
+        # origin HTTPS on the SHARED verifying session -- it borrows the same
+        # pool an in-flight scan already holds a slot in, so it adds no second
+        # limiter and there is nothing extra to close.
+        self.fetch_support = fetch_support
+        self._support = SupportInfoProbe(self.client, log)
 
     @staticmethod
     def _build_client() -> aiohttp.ClientSession:
@@ -408,11 +418,15 @@ class Scanner:
             trust_env=False,  # no ambient proxy/env surprises in a scanner
         )
 
-    async def scan(self, scan_target: str) -> tuple[ScanResult, FederationVersion]:
-        """Scan one target: classify registration, then probe federation version.
+    async def scan(
+        self, scan_target: str
+    ) -> tuple[ScanResult, FederationVersion, SupportInfo]:
+        """Scan one target: classify registration, then probe federation version,
+        then fetch the support well-known.
 
-        Returns ``(ScanResult, FederationVersion)``. ``self.timeout`` bounds the
-        WHOLE scan. The two phases share that one wall-clock budget:
+        Returns ``(ScanResult, FederationVersion, SupportInfo)``. ``self.timeout``
+        bounds the WHOLE scan. The three phases share that one wall-clock budget
+        in strict priority order:
 
           1. Classification runs first, under its own wait_for(self.timeout) --
              unchanged behaviour and unchanged priority. A timeout here is a
@@ -423,13 +437,19 @@ class Scanner:
              (``ok``) and wall-clock remains, and is bounded by exactly that
              remainder. The version string is a nice-to-have; reg status is the
              thing policy acts on, so the probe never delays or steals budget
-             from classification, and is the first thing sacrificed when a slow
-             target eats the budget. A non-authoritative probe (including "no
-             time left" and "reg scan failed") yields FederationVersion.no_signal(),
-             which tells record_scan to PRESERVE any previously stored version.
+             from classification.
 
-        Never raises; classification failure or probe failure are captured in the
-        returned values.
+          3. The support fetch runs last (and only when ``fetch_support`` is
+             enabled), under whatever remains after the version probe -- it is
+             the least important signal and the first thing sacrificed when a
+             slow target eats the budget. Like the version probe it is skipped
+             entirely when the reg-scan failed as a task.
+
+        Non-authoritative outcomes for phases 2 and 3 (including "no time left"
+        and "reg scan failed") yield no_signal(), which tells the write path to
+        PRESERVE previously stored data.
+
+        Never raises; failures of any phase are captured in the returned values.
         """
         t0 = asyncio.get_event_loop().time()
         try:
@@ -439,28 +459,43 @@ class Scanner:
             result = ScanResult(True, status)
         except asyncio.TimeoutError:
             self.log.debug("scan(%s) timed out after %.1fs", scan_target, self.timeout)
-            # Classification ate the whole budget -> no time for a version probe.
-            return ScanResult(True, UNKNOWN), FederationVersion.no_signal()
+            # Classification ate the whole budget -> no time for the follow-ups.
+            return ScanResult(True, UNKNOWN), FederationVersion.no_signal(), \
+                SupportInfo.no_signal()
         except Exception as e:  # noqa: BLE001 -- defensive; classify shouldn't raise
-            # Task-failure: skip the version probe entirely (they are independent
-            # signals, but a failed reg scan suppresses the probe).
-            return ScanResult(False, None, f"unexpected: {e}"), FederationVersion.no_signal()
+            # Task-failure: skip the follow-up phases entirely (they are
+            # independent signals, but a failed reg scan suppresses them).
+            return ScanResult(False, None, f"unexpected: {e}"), \
+                FederationVersion.no_signal(), SupportInfo.no_signal()
 
         # Version probe under the REMAINING budget. Skip if none is left.
+        version = FederationVersion.no_signal()
         remaining = self.timeout - (asyncio.get_event_loop().time() - t0)
-        if remaining <= 0:
-            return result, FederationVersion.no_signal()
-        try:
-            version = await asyncio.wait_for(
-                self._version.probe(scan_target), timeout=remaining
-            )
-        except asyncio.TimeoutError:
-            self.log.debug("version probe(%s) timed out", scan_target)
-            return result, FederationVersion.no_signal()
-        except Exception as e:  # noqa: BLE001 -- probe shouldn't raise
-            self.log.debug("version probe(%s) error: %s", scan_target, e)
-            return result, FederationVersion.no_signal()
-        return result, version
+        if remaining > 0:
+            try:
+                version = await asyncio.wait_for(
+                    self._version.probe(scan_target), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                self.log.debug("version probe(%s) timed out", scan_target)
+            except Exception as e:  # noqa: BLE001 -- probe shouldn't raise
+                self.log.debug("version probe(%s) error: %s", scan_target, e)
+
+        # Support well-known fetch under what is STILL left, gated on config.
+        support = SupportInfo.no_signal()
+        if self.fetch_support:
+            remaining = self.timeout - (asyncio.get_event_loop().time() - t0)
+            if remaining > 0:
+                try:
+                    support = await asyncio.wait_for(
+                        self._support.fetch(scan_target), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    self.log.debug("support fetch(%s) timed out", scan_target)
+                except Exception as e:  # noqa: BLE001 -- fetcher shouldn't raise
+                    self.log.debug("support fetch(%s) error: %s", scan_target, e)
+
+        return result, version, support
 
     async def aclose(self) -> None:
         """Close owned resources. The version probe always owns its private

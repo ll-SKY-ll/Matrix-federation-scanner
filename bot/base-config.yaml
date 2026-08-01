@@ -9,9 +9,15 @@ auto_config_event_type: "net.codestorm.csreg.auto_config"
 # ── Scanner (in-process registration checker) ───────────────────────────────
 scanner:
   # Total per-target scan budget. Classification runs first under this budget;
-  # the federation /version probe uses whatever wall-clock remains.
+  # the federation /version probe and the support well-known fetch use whatever
+  # wall-clock remains (in that order).
   # (recommended to leave above 120)
   timeout_seconds: 150
+  # Also fetch /.well-known/matrix/support during each scan and store the raw
+  # JSON document (plus fetch timestamp) in the local DB, keyed on the portless
+  # domain. Only a 200 response with a valid JSON object overwrites stored
+  # data; a 404 / blank page / non-JSON body leaves prior data untouched.
+  fetch_support: true
 
 # ── Queue settings for NEW servers────────────────────────────────────────────
 queue:

@@ -9,6 +9,7 @@ _LEAVES = [
     "policy_room",
     "auto_config_event_type",
     "scanner.timeout_seconds",
+    "scanner.fetch_support",
     "queue.scan_interval_seconds",
     "queue.scan_batch_limit",
     "rescan.interval_seconds",

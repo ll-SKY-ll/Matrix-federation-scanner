@@ -28,7 +28,7 @@ from .policy import POLICY_RULE_SERVER, PolicyManager
 from .regcheck import Scanner
 from .sources import PolicyListSource, PostgresSource, Source, TextFileSource
 from .taxonomy import KNOWN_STATUSES
-from .util import validate_server_name
+from .util import strip_port, validate_server_name
 
 # EWMA weight for the rolling average scan duration.
 _EWMA_ALPHA = 0.2
@@ -159,6 +159,7 @@ class CSRegScanner(Plugin):
             self.log,
             client=self._http_client,
             pool_limit=self._max_inflight,
+            fetch_support=bool(self.config["scanner.fetch_support"]),
         )
 
         # policy governance
@@ -701,7 +702,7 @@ class CSRegScanner(Plugin):
 
     async def _scan_one(self, scan_target: str) -> None:
         t0 = time.monotonic()
-        result, version = await self.scanner.scan(scan_target)
+        result, version, support = await self.scanner.scan(scan_target)
         dt = time.monotonic() - t0
         # EWMA kept for metrics only -- it no longer influences any setting.
         self._avg_scan = (1 - _EWMA_ALPHA) * self._avg_scan + _EWMA_ALPHA * dt
@@ -717,6 +718,16 @@ class CSRegScanner(Plugin):
             fed_name=version.name,
             fed_version=version.version,
         )
+
+        # Support well-known: write ONLY an authoritative fetch (200 + JSON
+        # object). Everything else -- 404, blank/HTML page, network error,
+        # oversize, or the phase being skipped/disabled -- performs no write, so
+        # prior stored data survives (overwrite-only-on-good-JSON, mirroring the
+        # fed_* preserve rule but via write-omission instead of SQL CASE).
+        # Keyed on the portless domain: the well-known lives on the origin, so
+        # every port-variant target of a domain maps to the same document.
+        if support.authoritative and support.raw_json is not None:
+            await self.db.record_support(strip_port(scan_target), support.raw_json)
 
         # Per-scan result log. Structured fields are ALWAYS present in extra
         # (null where N/A) for a future JSON log shipper, but our current pipeline
@@ -832,6 +843,7 @@ class CSRegScanner(Plugin):
         initial_achievable = q_batch / q_interval if q_interval > 0 else 0.0
         required, achievable = self._rates(buckets)
         fed_versions = await self.db.fed_version_counts()
+        support_total, support_reachable = await self.db.support_coverage()
         return {
             "servers": servers,
             "buckets": buckets,
@@ -866,4 +878,9 @@ class CSRegScanner(Plugin):
             },
             "scan_timeout": float(self.config["scanner.timeout_seconds"]),
             "fed_versions": fed_versions,
+            # Support-document coverage. Domain-granular (support_info is keyed
+            # on the portless domain), unlike every other count here, which is
+            # scan_target-granular -- see db.support_coverage.
+            "support_total": support_total,
+            "support_reachable": support_reachable,
         }

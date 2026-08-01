@@ -177,11 +177,54 @@ class MetricsServer:
             "advertised federation (name, version)"
         )
         out.append("# TYPE matrix_server_federation_version_count gauge")
-        for name, version, count in sorted(snap["fed_versions"]):
+        for name, version, count, _n_reachable in sorted(snap["fed_versions"]):
             out.append(
                 "matrix_server_federation_version_count"
                 f'{{name="{_esc_label(name)}",version="{_esc_label(version)}"}} {count}'
             )
+
+        # The same distribution restricted to targets whose registration status
+        # is not unknown. This is the denominator to use for "% of servers
+        # running X": the plain count above includes the unknown pile
+        # (unreachable hosts, WAF-blocked /register, ambiguous bodies), so every
+        # share computed against it is deflated by an amount that tracks ingress
+        # quality rather than anything about the population. Not a restatement of
+        # the series above -- a target can advertise a good fed_name while its
+        # registration status is unknown.
+        out.append(
+            "# HELP matrix_server_federation_version_reachable_count Scanned "
+            "servers per advertised federation (name, version), excluding those "
+            "whose registration status is unknown"
+        )
+        out.append("# TYPE matrix_server_federation_version_reachable_count gauge")
+        for name, version, _count, n_reachable in sorted(snap["fed_versions"]):
+            out.append(
+                "matrix_server_federation_version_reachable_count"
+                f'{{name="{_esc_label(name)}",version="{_esc_label(version)}"}} '
+                f"{n_reachable}"
+            )
+
+        # Support-document coverage: how many servers we hold a
+        # /.well-known/matrix/support document for. Both read 0 while
+        # scanner.fetch_support is off.
+        #
+        # GRANULARITY: these count DOMAINS, not scan targets. The well-known
+        # lives on the origin host, so matrix.org and matrix.org:8448 are two
+        # rows in `scanned` but share one support document -- support_info is
+        # keyed on the portless domain accordingly. Do NOT divide these by
+        # matrix_server_scanned_total; the units differ and the ratio is
+        # meaningless. The reachable variant counts a domain when at least one
+        # target under it is classified.
+        _gauge(out, "matrix_server_support_info_count",
+               "Domains for which a /.well-known/matrix/support document is "
+               "stored (domain-granular: NOT comparable to "
+               "matrix_server_scanned_total, which counts scan targets)",
+               snap["support_total"])
+        _gauge(out, "matrix_server_support_info_reachable_count",
+               "Domains for which a /.well-known/matrix/support document is "
+               "stored AND at least one scan target under that domain has a "
+               "registration status other than unknown (domain-granular)",
+               snap["support_reachable"])
 
         # Operational gauges.
         _gauge(out, "csreg_scan_queue_depth", "Pending domains in the scan queue",

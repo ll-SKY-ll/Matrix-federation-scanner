@@ -157,6 +157,41 @@ async def upgrade_v3(conn: Connection) -> None:
     await conn.execute("ALTER TABLE scanned ADD COLUMN fed_version_at BIGINT")
 
 
+@upgrade_table.register(
+    description="Add support_info table (/.well-known/matrix/support documents)"
+)
+async def upgrade_v4(conn: Connection) -> None:
+    """One row per PORTLESS domain holding the last authoritative support
+    document. Keyed on domain (not scan_target) because the well-known is
+    defined on the origin host -- matrix.org and matrix.org:8448 fetch the
+    SAME https://matrix.org/.well-known/matrix/support, so per-target rows
+    would just duplicate the identical document.
+
+      domain        -- portless server name (util.strip_port), PK
+      support_json  -- raw document as compact canonical JSON (guaranteed
+                       valid JSON: the fetcher re-serializes the parsed object;
+                       bounded by the 64 KiB wire cap). NOT NULL: a row exists
+                       only once an authoritative fetch has happened.
+      fetched_at    -- epoch seconds of the fetch that produced the CURRENT
+                       stored document (advances only on overwrite).
+
+    Preserve-on-no-signal falls out of the write path shape: a non-authoritative
+    fetch (404, network error, non-JSON body, ...) simply performs no write, so
+    no CASE gymnastics are needed here (unlike the fed_* columns, there is no
+    "authoritative null" to represent -- an authoritative answer always carries
+    a document).
+    """
+    await conn.execute(
+        """
+        CREATE TABLE support_info (
+            domain       TEXT PRIMARY KEY,
+            support_json TEXT NOT NULL,
+            fetched_at   BIGINT NOT NULL
+        )
+        """
+    )
+
+
 def now() -> int:
     return int(time.time())
 
@@ -503,6 +538,40 @@ class DB:
         )
         return [(r["scan_target"], r["reg_status"]) for r in rows]
 
+    # --- support well-known ----------------------------------------------------
+
+    async def record_support(self, domain: str, raw_json: str) -> None:
+        """Upsert the support document for a portless domain. Called ONLY with
+        an authoritative fetch result (200 + JSON object); the preserve-on-
+        no-signal rule is enforced by the caller simply not calling this, so a
+        404 / blank page / network error can never touch stored data. fetched_at
+        stamps the write, i.e. always reflects when the CURRENT document was
+        obtained."""
+        await self._db.execute(
+            """
+            INSERT INTO support_info (domain, support_json, fetched_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (domain) DO UPDATE SET
+                support_json = excluded.support_json,
+                fetched_at   = excluded.fetched_at
+            """,
+            domain,
+            raw_json,
+            now(),
+        )
+
+    async def get_support(self, domain: str) -> tuple[str, int] | None:
+        """(support_json, fetched_at) for a portless domain, or None if no
+        authoritative fetch has ever landed. For CLI/inspection use; the scan
+        path itself never reads this back."""
+        row = await self._db.fetchrow(
+            "SELECT support_json, fetched_at FROM support_info WHERE domain = $1",
+            domain,
+        )
+        if row is None:
+            return None
+        return row["support_json"], int(row["fetched_at"])
+
     # --- metrics / counts ----------------------------------------------------
 
     async def all_statuses(self) -> list[tuple[str, str, int | None]]:
@@ -517,12 +586,29 @@ class DB:
         )
         return {r["reg_status"]: int(r["n"]) for r in rows}
 
-    async def fed_version_counts(self) -> list[tuple[str, str, int]]:
+    async def fed_version_counts(self) -> list[tuple[str, str, int, int]]:
         """Server counts grouped by (fed_name, fed_version) pair, for the
         matrix_server_federation_version_count metric. The (name, version)
         analogue of bucket_counts -- a GROUP BY over the whole table on the
         metrics clock, which is why fed_name/fed_version are deliberately
         unindexed (see upgrade_v3).
+
+        Returns 4-tuples: (name, version, count, count_reachable). The fourth
+        element repeats the count with `reg_status <> 'unknown'` applied, giving
+        the distribution over targets we hold an actual classification for --
+        the honest denominator for share-of-population panels, since the plain
+        count's unknown share prevents us from getting insigts into the current
+        actual population of matrix servers. Computed in the same GROUP BY 
+        rather than a second pass.
+
+        The two are genuinely different populations, not a restatement: a target
+        can carry a good fed_name while sitting at reg_status 'unknown' whenever
+        federation answers cleanly but /register was proxied, WAF-challenged, or
+        returned something the classifier refuses to affirm.
+
+        SUM(CASE WHEN) rather than COUNT(*) FILTER because FILTER needs SQLite
+        >= 3.30; COALESCE because SUM over an empty group is NULL on both
+        backends.
 
         Only rows whose fed_name is non-null are counted: a row that has never
         had an authoritative probe (or whose server reported a null name) has no
@@ -540,13 +626,57 @@ class DB:
             """
             SELECT fed_name AS name,
                    COALESCE(fed_version, '') AS version,
-                   COUNT(*) AS n
+                   COUNT(*) AS n,
+                   COALESCE(SUM(CASE WHEN reg_status <> 'unknown'
+                                     THEN 1 ELSE 0 END), 0) AS n_reachable
             FROM scanned
             WHERE fed_name IS NOT NULL
             GROUP BY fed_name, COALESCE(fed_version, '')
             """
         )
-        return [(r["name"], r["version"], int(r["n"])) for r in rows]
+        return [
+            (r["name"], r["version"], int(r["n"]), int(r["n_reachable"]))
+            for r in rows
+        ]
+
+    async def support_coverage(self) -> tuple[int, int]:
+        """(total, reachable): how many DOMAINS we hold a support document for,
+        and how many of those have at least one classified scan target.
+
+        Counts rows in support_info, where a row exists only once an
+        authoritative fetch has happened (see upgrade_v4) -- so no predicate on
+        the document itself is needed or wanted. Both figures read 0 while
+        scanner.fetch_support is off, which is the honest answer.
+
+        GRANULARITY WARNING, carried into the metric HELP text: support_info is
+        keyed on the PORTLESS domain because the well-known lives on the origin
+        host, while everything else in this exposition is keyed on scan_target
+        (port-bearing). matrix.org and matrix.org:8448 are two scanned rows but
+        share ONE support_info row. These two counts are therefore NOT
+        commensurable with matrix_server_scanned_total and must not be used as
+        its numerator.
+
+        `reachable` uses EXISTS rather than a join precisely because of that
+        one-to-many: joining support_info to scanned on domain would multiply a
+        single document across its targets and overcount. EXISTS asks the
+        question the metric actually means -- "is any target under this domain
+        classified" -- and short-circuits on the first hit via
+        scanned_domain_idx. A domain whose only targets are all 'unknown' is
+        excluded; a domain with one classified target and one unknown counts
+        once.
+        """
+        row = await self._db.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(CASE WHEN EXISTS (
+                       SELECT 1 FROM scanned
+                       WHERE scanned.domain = support_info.domain
+                         AND scanned.reg_status <> 'unknown'
+                   ) THEN 1 ELSE 0 END), 0) AS reachable
+            FROM support_info
+            """
+        )
+        return int(row["total"]), int(row["reachable"])
 
     async def scan_totals(self) -> tuple[int, int, int]:
         """Cumulative scan-execution totals as (initial, rescans, total).
