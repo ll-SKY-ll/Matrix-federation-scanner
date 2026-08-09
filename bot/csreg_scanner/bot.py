@@ -736,10 +736,17 @@ class CSRegScanner(Plugin):
         #
         # Level: a reg-status transition -- including the first-ever sighting of
         # a target (previous_status None) -- is INFO so it surfaces in the maubot
-        # web log. An unchanged status is DEBUG (the steady-state
-        # rescan firehose stays out of INFO). A task-failure is not a transition
-        # and stays DEBUG too; it carries the (quoted) error instead of version
-        # keys, since the version probe is skipped when the reg-scan fails.
+        # web log. A federation-version transition (record.version_changed) is
+        # ALSO INFO, even when the reg_status is unchanged, so version rollouts
+        # surface the same way status flips do. When BOTH move in one scan they
+        # share a single combined INFO line. An otherwise-unchanged status is
+        # DEBUG (the steady-state rescan firehose stays out of INFO). A
+        # task-failure is not a transition and stays DEBUG too; it carries the
+        # (quoted) error instead of version keys, since the version probe is
+        # skipped when the reg-scan fails.
+        prev_name, prev_version = (
+            record.previous_version if record.previous_version else (None, None)
+        )
         extra = {
             "csreg_event": "scan_result",
             "scan_target": scan_target,
@@ -747,6 +754,8 @@ class CSRegScanner(Plugin):
             "previous_status": record.previous_status,
             "fed_name": version.name,
             "fed_version": version.version,
+            "previous_fed_name": prev_name,
+            "previous_fed_version": prev_version,
         }
         # logfmt rendering of the version pair, shared by the change/unchanged
         # lines. A null name/version renders as "-" (kept out of the message as
@@ -754,6 +763,17 @@ class CSRegScanner(Plugin):
         ver_kv = (
             f"name={version.name if version.name is not None else '-'} "
             f"version={version.version if version.version is not None else '-'}"
+        )
+        # Version transition rendered as an old -> new pair, joined name/version
+        # so "Synapse/1.96.0 -> Synapse/1.97.0" reads as one token per side. A
+        # null side renders "-" (e.g. first authoritative sighting: "- -> ...").
+        def _ver_side(name: str | None, ver: str | None) -> str:
+            n = name if name is not None else "-"
+            v = ver if ver is not None else "-"
+            return f"{n}/{v}"
+        ver_change_kv = (
+            f"{_ver_side(prev_name, prev_version)} -> "
+            f"{_ver_side(version.name, version.version)}"
         )
         if not result.ok:
             extra["scan_error"] = result.error
@@ -763,10 +783,23 @@ class CSRegScanner(Plugin):
             self.log.debug(
                 'scan failed for %s: error="%s"', scan_target, err, extra=extra
             )
+        elif record.changed and record.version_changed:
+            # Both moved this scan -- one combined INFO line.
+            self.log.info(
+                "reg-status + version change for %s: %s -> %s | version %s",
+                scan_target, record.previous_status, result.status,
+                ver_change_kv, extra=extra,
+            )
         elif record.changed:
             self.log.info(
                 "reg-status change for %s: %s -> %s %s",
                 scan_target, record.previous_status, result.status, ver_kv,
+                extra=extra,
+            )
+        elif record.version_changed:
+            self.log.info(
+                "version change for %s: %s (status %s unchanged)",
+                scan_target, ver_change_kv, result.status,
                 extra=extra,
             )
         else:
