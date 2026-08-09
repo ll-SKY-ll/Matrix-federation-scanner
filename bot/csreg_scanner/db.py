@@ -50,10 +50,22 @@ class ScanRecord:
     NOT set it (logging level is driven by reg-status transitions alone). It also
     reflects the STORED status: on a task-failure the stored status is preserved
     (not overwritten to unknown), so a failed scan does not count as a change.
+
+    ``version_changed`` is the independent federation-version signal: True only
+    when this write was AUTHORITATIVE (fed_observed) AND the reported (name,
+    version) pair differs from the stored one AND the new pair is not a
+    fall-to-null. That last clause means an authoritative null-report (a server
+    that stopped advertising a version: X -> -) does NOT count, matching the
+    reg-status rule that a preserved value isn't a change. A non-authoritative
+    probe preserves the stored version, so it can never set this flag.
+    ``previous_version`` is the prior (fed_name, fed_version) pair, or None when
+    there was no prior row.
     """
 
     changed: bool
     previous_status: str | None
+    version_changed: bool = False
+    previous_version: tuple[str | None, str | None] | None = None
 
 # SQLite chunk size for the multi-row VALUES batch in enqueue. One bound
 # parameter per target, so this must stay well under SQLITE_MAX_VARIABLE_NUMBER
@@ -439,7 +451,8 @@ class DB:
         async with self._db.acquire() as conn:
             async with conn.transaction():
                 existing = await conn.fetchrow(
-                    "SELECT reg_status, error_streak, status_since "
+                    "SELECT reg_status, error_streak, status_since, "
+                    "fed_name, fed_version "
                     "FROM scanned WHERE scan_target = $1",
                     scan_target,
                 )
@@ -472,6 +485,23 @@ class DB:
                 else:
                     changed = False
                     status_since = existing["status_since"] or ts
+
+                # Federation version change signal, computed independently of the
+                # reg_status change. Only an AUTHORITATIVE probe can register a
+                # change (a non-authoritative probe preserves the stored pair, so
+                # comparing new-vs-stored would be a no-op anyway). A fall-to-null
+                # -- an authoritative null-report that clears a previously-known
+                # version (X -> -) -- is deliberately NOT counted, mirroring the
+                # reg-status rule that a preserved/absent value isn't a change.
+                prev_name = existing["fed_name"] if existing else None
+                prev_version = existing["fed_version"] if existing else None
+                prev_ver_pair = (prev_name, prev_version) if existing else None
+                new_ver_pair = (fed_name, fed_version)
+                version_changed = (
+                    fed_observed
+                    and new_ver_pair != (prev_name, prev_version)
+                    and not (fed_name is None and fed_version is None)
+                )
 
                 # Federation version values to feed the INSERT branch. On a
                 # brand-new row there is nothing to preserve, so a non-authoritative
@@ -523,7 +553,12 @@ class DB:
                 await conn.execute(
                     "DELETE FROM scan_queue WHERE scan_target = $1", scan_target
                 )
-        return ScanRecord(changed=changed, previous_status=prev_status)
+        return ScanRecord(
+            changed=changed,
+            previous_status=prev_status,
+            version_changed=version_changed,
+            previous_version=prev_ver_pair,
+        )
 
     async def statuses_for_domain(self, domain: str) -> list[tuple[str, str]]:
         """Every (scan_target, reg_status) recorded for any scan target sharing
