@@ -3,7 +3,7 @@
   "kind": "Dashboard",
   "metadata": {
     "name": "ad4brvd",
-    "generation": 31,
+    "generation": 33,
     "creationTimestamp": "2026-06-13T15:24:50Z",
     "labels": {},
     "annotations": {}
@@ -2900,7 +2900,7 @@
         "kind": "CustomVariable",
         "spec": {
           "name": "server_reachability",
-          "query": "all : matrix_server_federation_version_count{job=\"$job\"\\, name=~\"$server_fam\"}, only online : matrix_server_federation_version_reachable_count{job=\"$job\"\\, name=~\"$server_fam\"}, only offline : (matrix_server_federation_version_count{job=\"$job\"\\, name=~\"$server_fam\"}) - (matrix_server_federation_version_reachable_count{job=\"$job\"\\, name=~\"$server_fam\"})",
+          "query": "[\n  { \"value\": \"matrix_server_federation_version_count{job=\\\"$job\\\", name=~\\\"${server_fam:regex}\\\"}\", \"text\": \"all\" },\n  { \"value\": \"matrix_server_federation_version_reachable_count{job=\\\"$job\\\", name=~\\\"${server_fam:regex}\\\"}\", \"text\": \"only online\" },\n  { \"value\": \"(matrix_server_federation_version_count{job=\\\"$job\\\", name=~\\\"${server_fam:regex}\\\"}) - (matrix_server_federation_version_reachable_count{job=\\\"$job\\\", name=~\\\"${server_fam:regex}\\\"})\", \"text\": \"only offline\" }\n]",
           "current": {
             "text": "all",
             "value": "matrix_server_federation_version_count{job=\"maubot_csreg\", name=~\".*\"}"
@@ -2912,7 +2912,7 @@
           "hide": "dontHide",
           "skipUrlSync": false,
           "allowCustomValue": false,
-          "valuesFormat": "csv"
+          "valuesFormat": "json"
         }
       }
     ],
