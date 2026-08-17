@@ -1,0 +1,12 @@
+# Test dependencies for the csreg_scanner suite.
+#
+# maubot is required because csreg_scanner/__init__.py imports bot.py at package
+# import time, so even the pure-logic tests (which import submodules) pull the
+# package __init__ and therefore maubot. maubot brings mautrix + aiohttp
+# transitively; db.py's tests use mautrix's async_db abstraction directly.
+maubot
+dnspython
+asyncpg          # postgres backend for the DB tests (skipped without a DSN)
+aiosqlite        # sqlite backend for the DB tests (always runs)
+pytest
+pytest-asyncio

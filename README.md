@@ -183,9 +183,16 @@ type is set by `auto_config_event_type`, default
 
 ```json
 {
-    "schema_version": 1,
+    "schema_version": 2,
+    "min_bot_version": "0.2.0",
+    "stale_max_age": 5184000,
+    "cleanup_bot_ids": [
+        "@reg-scanner:codestorm.net"
+    ],
     "recommendation": "m.ban",
     "ban_reason": "open-reg",
+    "max_bans_per_etld1": 5,
+    "min_psl_version": "2026-08-14_20-15-49_UTC",
     "default_action": "hold",
     "decision_map": {
         "dangerously_open": "ban",
@@ -203,6 +210,15 @@ type is set by `auto_config_event_type`, default
 Anything not positively resolved to `ban` or `unban` falls through to `hold`
 (no write). Until a valid `auto_config` event is present, policy writes stay
 halted — the bot fails closed.
+
+#### Public suffix list
+
+Since version 0.2.0 and in combination with schema version 2, the bot also has 
+support for using the [Public Suffix List](https://publicsuffix.org/) to 
+mitigate attacks where an attacker might intentionally spin up endless servers 
+on subdomains in order to bloat the size of the policy list to a extend where 
+bots wont be able to apply it any longer due to exceeding the maximum 
+allowed size of a matrix event.
 
 ### Tuning scan intervals
 

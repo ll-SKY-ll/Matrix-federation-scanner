@@ -19,6 +19,33 @@ scanner:
   # data; a 404 / blank page / non-JSON body leaves prior data untouched.
   fetch_support: true
 
+  # Connection-target IP filtering, applied to SCANS ONLY (ingress sources and
+  # the local /counts pass-through are never filtered).
+  # An EMPTY blacklist disables filtering
+  # entirely (no resolver wrapper is installed at all).
+  ip_range_blacklist:
+    - "127.0.0.0/8"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    - "100.64.0.0/10"
+    - "192.0.0.0/24"
+    - "169.254.0.0/16"
+    - "192.88.99.0/24"
+    - "198.18.0.0/15"
+    - "192.0.2.0/24"
+    - "198.51.100.0/24"
+    - "203.0.113.0/24"
+    - "224.0.0.0/4"
+    - "::1/128"
+    - "fe80::/10"
+    - "fc00::/7"
+    - "2001:db8::/32"
+    - "ff00::/8"
+    - "fec0::/10"
+  # Entries in the whitelist win over the blacklist
+  ip_range_whitelist: []
+
 # ── Queue settings for NEW servers────────────────────────────────────────────
 queue:
   # how often to check the queue and spawn scan tasks if there are new servers
@@ -83,6 +110,10 @@ sources:
 policy:
   # controls how many policies the bot can write per second
   max_writes_per_second: 5
+
+  # Enables auto updating the public suffix list daily instead of relying purely on
+  # the version shipped with the bot.
+  psl_auto_update: true
 
 # ── Metrics ─────────────────────────────────────────────────────────────────
 metrics:

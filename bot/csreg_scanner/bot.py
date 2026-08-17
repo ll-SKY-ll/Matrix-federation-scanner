@@ -9,8 +9,11 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import pkgutil
 import time
+from datetime import datetime, timezone
+from typing import Any
 
 import aiohttp
 from aiohttp.web import Request, Response
@@ -23,15 +26,107 @@ from mautrix.api import Method, Path
 
 from .config import Config
 from .db import DB, upgrade_table
+from .ipfilter import IPRangePolicy, build_connector, parse_networks
 from .metrics import MetricsServer
+from .psl import (
+    PSLHolder,
+    PSLValidationError,
+    load_vendored_psl,
+    validate_psl_text,
+)
+from .pslfetch import PSLFetcher, jittered_interval
 from .policy import POLICY_RULE_SERVER, PolicyManager
 from .regcheck import Scanner
 from .sources import PolicyListSource, PostgresSource, Source, TextFileSource
 from .taxonomy import KNOWN_STATUSES
-from .util import strip_port, validate_server_name
+from .util import now, strip_port, validate_server_name
 
 # EWMA weight for the rolling average scan duration.
 _EWMA_ALPHA = 0.2
+
+# How often to retry loading governance state (the policy-rule fold and the
+# auto_config event) after a failed read. The bot stays halted for the whole
+# retry window, so this is a "how fast do we recover from a homeserver hiccup"
+# knob, not a correctness one -- and it is deliberately not operator-tunable.
+_GOVERNANCE_RETRY_SECONDS = 60
+
+# Suffix-list refresh cadence. Daily, jittered: the list changes a few times a
+# week at most, and this hits one volunteer-run host from every bot in the fleet.
+_PSL_REFRESH_SECONDS = 24 * 60 * 60
+
+# Retry cadence while the suffix list is DEGRADED -- no list at all, or an active
+# list below min_psl_version. Both are states a fetch could resolve, and both
+# block policy writes when a cap is configured, so waiting a full day to try
+# again would leave the bot needlessly halted. Doubles up to the normal interval
+# so a floor that no published list can satisfy (a typo, or a stamp from the
+# future) degrades to daily polling instead of hammering publicsuffix.org from
+# every bot in the fleet forever.
+_PSL_DEGRADED_RETRY_SECONDS = 10 * 60
+
+# Default staleness T (seconds) for any status with no explicit
+# rescan.staleness_seconds entry, used when `unknown` (which normally supplies
+# this default) is itself unconfigured. One day. Single source of truth for both
+# the sanitizer's warning and _required_rate's fallback so they can't drift.
+_DEFAULT_STALENESS_SECONDS = 86_400
+
+
+def _sanitize_staleness(
+    raw: Any, log: logging.Logger
+) -> dict[str, int]:
+    """Validate the rescan.staleness_seconds config into a clean {status: int}.
+
+    Extracted from start() so it is testable in isolation (no Plugin runtime).
+
+    Rules, each dropping the offending entry with a structured warning:
+      * a key not in KNOWN_STATUSES is dropped -- both prevents bad SQL (keys are
+        interpolated into a CASE by db.most_overdue) and surfaces a config typo
+        that would otherwise silently fall through to the default T.
+      * a non-integer value is dropped.
+      * a non-positive value is dropped (a <= 0 T would be a divide-by-zero /
+        meaningless deadline).
+
+    Finally, if there is no ``unknown`` entry, warn ONCE: `unknown` doubles as the
+    default T for any unmapped status (see _required_rate), so its absence
+    silently makes that default the hardcoded _DEFAULT_STALENESS_SECONDS. The
+    warning goes here, at config load, rather than in _required_rate, which runs
+    every rescan tick and would spam the same line forever.
+    """
+    staleness: dict[str, int] = {}
+    for status, secs in dict(raw or {}).items():
+        if status not in KNOWN_STATUSES:
+            log.warning(
+                "rescan.staleness_seconds: ignoring unknown status %r", status,
+                extra={"csreg_alarm": "staleness_unknown_status", "key": status},
+            )
+            continue
+        try:
+            seconds = int(secs)
+        except (TypeError, ValueError):
+            log.warning(
+                "rescan.staleness_seconds[%s]: %r is not a whole number of "
+                "seconds; ignoring", status, secs,
+                extra={"csreg_alarm": "staleness_invalid_value",
+                       "key": status, "value": secs},
+            )
+            continue
+        if seconds <= 0:
+            log.warning(
+                "rescan.staleness_seconds[%s]: must be > 0, got %r; ignoring",
+                status, secs,
+                extra={"csreg_alarm": "staleness_invalid_value",
+                       "key": status, "value": secs},
+            )
+            continue
+        staleness[status] = seconds
+
+    if "unknown" not in staleness:
+        log.warning(
+            "rescan.staleness_seconds: no 'unknown' entry; unmapped statuses "
+            "will fall back to the default of %d seconds",
+            _DEFAULT_STALENESS_SECONDS,
+            extra={"csreg_alarm": "staleness_unknown_unset"},
+        )
+    return staleness
 
 # MSC4133 custom profile field advertising this plugin's running version.
 _VERSION_PROFILE_FIELD = "net.codestorm.federation-scanner.version"
@@ -124,20 +219,10 @@ class CSRegScanner(Plugin):
         # restart and re-converges within a few ticks.
         self._rescan_credit: float = 0.0
 
-        # Per-status staleness T (seconds), sanitized once. Keys are interpolated
-        # into SQL by db.most_overdue, so drop anything that isn't a known status
-        # here -- this both prevents bad SQL and surfaces config typos (a typo'd
-        # bucket would otherwise silently fall through to the default T).
-        self._staleness: dict[str, int] = {}
-        for status, secs in dict(self.config["rescan.staleness_seconds"] or {}).items():
-            if status not in KNOWN_STATUSES:
-                self.log.warning(
-                    "rescan.staleness_seconds: ignoring unknown status %r", status,
-                    extra={"csreg_alarm": "staleness_unknown_status", "key": status},
-                )
-                continue
-            self._staleness[status] = int(secs)
-
+        # Per-status staleness T (seconds), sanitized once at config load.
+        self._staleness: dict[str, int] = _sanitize_staleness(
+            self.config["rescan.staleness_seconds"], self.log
+        )
         # scanner: in-process registration checker over a shared aiohttp client.
         # The client is pooled across all scans and closed in stop(); the
         # Scanner does not own it (aclose() is a no-op for an injected client).
@@ -148,8 +233,31 @@ class CSRegScanner(Plugin):
         # Connector: sized to exactly the admission ceiling. Every scan issues
         # its probes as sequential awaits, so an in-flight scan holds at most
         # ONE connection on this session at a time.
+        #
+        # Connection-target IP filter, applied to SCAN traffic only. A scanned
+        # server picks the host:port we connect to (m.server / m.homeserver.
+        # base_url), so without this it can aim the scanner at loopback or
+        # RFC1918. Installed on the connector's RESOLVER, not checked against the
+        # target name, because the name is usually a DNS record and a name
+        # pointing at 10.0.0.1 would otherwise sail through -- that also covers
+        # redirect chains for free. Ingress sources and the /calc/data
+        # pass-through keep their own unfiltered sessions on purpose (source URLs
+        # are operator-controlled, and /counts is loopback by design and would
+        # break under the default blacklist).
+        self._ip_policy = IPRangePolicy(
+            parse_networks(
+                self.config["scanner.ip_range_blacklist"], self.log,
+                field="ip_range_blacklist", strict=True,
+            ),
+            parse_networks(
+                self.config["scanner.ip_range_whitelist"], self.log,
+                field="ip_range_whitelist",
+            ),
+        )
         self._http_client = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=self._max_inflight),
+            connector=build_connector(
+                self._ip_policy, self.log, limit=self._max_inflight
+            ),
             headers={"User-Agent": "csreg-scanner (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)", "Accept": "application/json"},
             timeout=aiohttp.ClientTimeout(sock_connect=3.0, sock_read=8.0),
             trust_env=False,
@@ -160,9 +268,32 @@ class CSRegScanner(Plugin):
             client=self._http_client,
             pool_limit=self._max_inflight,
             fetch_support=bool(self.config["scanner.fetch_support"]),
+            ip_policy=self._ip_policy,
         )
 
         # policy governance
+        #
+        # Suffix-list plumbing all comes before PolicyManager, which reads three
+        # pieces of it: the holder (the cap-and-floor evaluation in
+        # _apply_auto_config needs a list to compare against), the wake setter,
+        # and the auto-update flag.
+        #
+        # The fetcher is constructed only when enabled, so "auto-update off"
+        # means it does not EXIST rather than merely being unreachable. Costs
+        # nothing either way (PSLFetcher does no I/O in __init__), but it makes
+        # the guarantee local instead of something you have to trace the call
+        # graph to confirm.
+        self._psl_auto_update = bool(self.config["policy.psl_auto_update"])
+        self._psl_fetcher = (
+            PSLFetcher(self.http, self.log) if self._psl_auto_update else None
+        )
+        # Set by policy when the floor halt engages, so the refresh task can cut
+        # its sleep short instead of waiting out a day-long timer after a
+        # min_psl_version bump.
+        self._psl_wake = asyncio.Event()
+        # One-shot and local (no network): vendored copy plus any cached blob,
+        # freshest wins.
+        self._psl_holder = await self._load_psl_local()
         self.policy = PolicyManager(
             self.client,
             RoomID(self.config["policy_room"]),
@@ -171,9 +302,18 @@ class CSRegScanner(Plugin):
             known_statuses=KNOWN_STATUSES,
             log=self.log,
             domain_statuses=self.db.statuses_for_domain,
+            own_version=self._own_version(),
+            psl_holder=self._psl_holder,
+            on_psl_floor_halt=self._psl_wake.set,
+            psl_auto_update=self._psl_auto_update,
         )
-        await self.policy.load_rules()
-        await self.policy.refresh_auto_config()
+        # Both governance reads are attempted inline so a healthy start is
+        # fully synchronous, exactly as before. Their success is remembered:
+        # either failing leaves the policy layer HALTED (the rule fold is not
+        # marked loaded, so no write can happen against an empty fold) and arms
+        # the resync task below.
+        self._governance_ok = await self.policy.load_rules()
+        self._governance_ok &= await self.policy.refresh_auto_config()
 
         # Live governance-state handler, registered under the two SPECIFIC state
         # types it watches rather than @event.on(EventType.ALL). Under ALL,
@@ -254,6 +394,16 @@ class CSRegScanner(Plugin):
             await self.metrics.start()
 
         # background clocks
+        if not self._governance_ok:
+            self.log.error(
+                "governance state incomplete at startup; policy writes are "
+                "HALTED and will be retried every %ds", _GOVERNANCE_RETRY_SECONDS,
+                extra={"csreg_alarm": "governance_resync_pending",
+                       "retry_seconds": _GOVERNANCE_RETRY_SECONDS},
+            )
+            self._tasks.append(asyncio.create_task(self._governance_retry_loop()))
+        if self._psl_auto_update:
+            self._tasks.append(asyncio.create_task(self._psl_refresh_loop()))
         for source, interval in self._sources:
             self._tasks.append(asyncio.create_task(self._source_loop(source, interval)))
         if self.scanner is not None:
@@ -267,6 +417,260 @@ class CSRegScanner(Plugin):
         self.log.info("csreg started: %d source(s), scanner=%s, metrics=%s",
                       len(self._sources), bool(self.scanner), bool(self.metrics))
 
+    async def _load_psl_local(self) -> PSLHolder:
+        """Build the active suffix list from local sources only: the vendored
+        copy, plus the cached blob from a previous fetch. Freshest VERSION wins.
+
+        Deliberately NOT a retry loop, unlike the governance reads. Neither
+        source fails transiently in a way retrying fixes: a missing cache row
+        means there has never been a successful fetch, and an unreadable vendored
+        copy is a packaging error. The online fetch is what recovers from
+        transient conditions, and it has its own task.
+
+        The cached blob is re-validated through the full gauntlet on read, even
+        though it passed on the way in: a row outlives the code that wrote it, so
+        it can have been hand-edited, restored from an old backup, or written by a
+        version whose validation differed. A bad row is discarded in favour of
+        vendored rather than adopted.
+
+        Always returns a holder, EMPTY (current = None) when neither source
+        yields a list. It must not raise: this runs inside start(), so an
+        exception here kills the plugin outright -- which would be a hard block
+        even for a deployment with no ban cap configured, where the suffix list is
+        not used for anything. Degrading instead means such a bot starts normally
+        with an alarm, a bot WITH a cap halts on the cap-and-no-list rule in
+        reevaluate_psl_floor, and in both cases the refresh task can still adopt a
+        fetched list and recover -- which it could not do through a holder that
+        was never constructed.
+        """
+        vendored = None
+        try:
+            vendored = load_vendored_psl()
+        except Exception as e:  # noqa: BLE001 -- packaging/IO failure
+            self.log.error(
+                "vendored public suffix list unavailable: %s", e,
+                extra={"csreg_alarm": "psl_vendored_unavailable", "error": str(e)},
+            )
+
+        cached = None
+        try:
+            row = await self.db.get_cached_psl()
+        except Exception as e:  # noqa: BLE001 -- DB read failure is not fatal here
+            row = None
+            self.log.warning("could not read cached public suffix list: %s", e)
+        if row is not None:
+            version_raw, _commit, body, fetched_at = row
+            try:
+                cached = validate_psl_text(body, source=f"cache (fetched {fetched_at})")
+            except PSLValidationError as e:
+                self.log.warning(
+                    "cached public suffix list %s failed validation; ignoring it: %s",
+                    version_raw, e,
+                    extra={"csreg_alarm": "psl_cache_invalid",
+                           "version": version_raw, "error": str(e)},
+                )
+
+        # Freshest wins. A cached copy older than vendored happens after a
+        # package upgrade and is simply superseded, not an error.
+        candidates = [p for p in (vendored, cached) if p is not None]
+        if not candidates:
+            self.log.error(
+                "no public suffix list available from any local source; the "
+                "per-eTLD+1 ban cap cannot be enforced until a fetch succeeds",
+                extra={"csreg_alarm": "psl_unavailable"},
+            )
+            return PSLHolder(None)
+        best = max(candidates, key=lambda p: p.version or datetime.min.replace(
+            tzinfo=timezone.utc))
+        self.log.info(
+            "active public suffix list: %s", best.describe(),
+            extra={"csreg_event": "psl_loaded", "psl_version": best.version_raw,
+                   "psl_source": best.source},
+        )
+        return PSLHolder(best)
+
+    async def _psl_refresh_loop(self) -> None:
+        """Keep the suffix list fresh. Long-lived; cancelled by stop().
+
+        Separate from the governance retry loop on purpose. That loop EXITS once
+        room state is readable, treats failure as a halt, and retries every 60s --
+        all three wrong here: freshness is a permanent concern, a fetch failure
+        must NOT halt (we keep the list we have), and polling publicsuffix.org
+        every minute from a fleet would earn a rate-limit and convert a freshness
+        problem into an availability one.
+
+        The first pass is skipped when the cached blob is already younger than the
+        interval, so an on_external_config_update (stop+start) during a
+        config-editing session does not produce a burst of fetches -- UNLESS the
+        list is degraded, in which case a fresh cache is exactly what is not good
+        enough and the fetch happens immediately.
+
+        Cadence has two speeds. Healthy: daily. Degraded (no list, or below
+        min_psl_version): _PSL_DEGRADED_RETRY_SECONDS, doubling toward daily. The
+        doubling matters because "degraded" includes a floor no published list can
+        satisfy -- a typo, or a stamp ahead of upstream -- where retrying forever
+        at ten minutes would be a fleet-wide hammering of one volunteer-run host
+        with no possible resolution. Any real progress (a newer list adopted) or a
+        floor change resets it to the fast interval.
+        """
+        backoff = float(_PSL_DEGRADED_RETRY_SECONDS)
+        if not self._psl_degraded() and await self._psl_cache_is_fresh(
+                float(_PSL_REFRESH_SECONDS)):
+            self.log.debug("cached public suffix list is fresh; deferring refresh")
+            await self._psl_sleep(jittered_interval(float(_PSL_REFRESH_SECONDS)))
+        while True:
+            adopted = False
+            try:
+                adopted = await self._psl_refresh_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 -- never let the clock die
+                self.log.warning("public suffix list refresh error: %s", e)
+            if self._psl_degraded():
+                if adopted:
+                    backoff = float(_PSL_DEGRADED_RETRY_SECONDS)
+                interval = backoff
+                backoff = min(backoff * 2, float(_PSL_REFRESH_SECONDS))
+                self.log.info(
+                    "public suffix list degraded (%s); retrying in %.0fs",
+                    self.policy.halt_reason or "no list available", interval,
+                    extra={"csreg_alarm": "psl_degraded",
+                           "retry_seconds": round(interval)},
+                )
+            else:
+                backoff = float(_PSL_DEGRADED_RETRY_SECONDS)
+                interval = float(_PSL_REFRESH_SECONDS)
+            if await self._psl_sleep(jittered_interval(interval)):
+                # Woken by a floor change rather than the timer: treat it as fresh
+                # trouble and start the ladder over, so a min_psl_version bump gets
+                # the fast cadence even if we had already backed off.
+                backoff = float(_PSL_DEGRADED_RETRY_SECONDS)
+
+    def _psl_degraded(self) -> bool:
+        """No list at all, or halted on the version floor -- i.e. a state a fetch
+        could plausibly fix. Note the no-list case is checked independently of the
+        cap: with no cap the bot is not halted, but it still has no list and
+        should keep trying to get one."""
+        no_list = self._psl_holder is None or self._psl_holder.current is None
+        return no_list or self.policy.psl_floor_halted
+
+    async def _psl_sleep(self, seconds: float) -> bool:
+        """Sleep, returning early if the floor halt engages. True if woken."""
+        try:
+            await asyncio.wait_for(self._psl_wake.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return False
+        self._psl_wake.clear()
+        self.log.debug("public suffix list refresh woken by a floor change")
+        return True
+
+    async def _psl_cache_is_fresh(self, interval: float) -> bool:
+        try:
+            row = await self.db.get_cached_psl()
+        except Exception:  # noqa: BLE001
+            return False
+        return row is not None and (now() - row[3]) < interval
+
+    async def _psl_refresh_once(self) -> bool:
+        """One fetch/validate/adopt cycle. Returns whether a newer list was
+        adopted, which the caller uses to decide whether it made progress."""
+        if self._psl_fetcher is None:
+            # Unreachable: the loop that calls this is only started when
+            # auto-update is on. Defensive, so a future caller cannot turn a
+            # disabled fetcher into an AttributeError.
+            return False
+        outcome = await self._psl_fetcher.fetch()
+        if outcome.not_modified:
+            self.log.debug("public suffix list unchanged upstream (304)")
+            return False
+        if outcome.psl is None:
+            # WARNING, not ERROR: we still have a usable list. Whether that list
+            # is ACCEPTABLE is decided by the floor, not here.
+            self.log.warning(
+                "public suffix list refresh failed: %s", outcome.error,
+                extra={"csreg_alarm": "psl_refresh_failed",
+                       "error": outcome.error,
+                       "active_version": self._psl_holder.version_raw},
+            )
+            return False
+        if not self._psl_holder.adopt(outcome.psl):
+            self.log.debug(
+                "fetched public suffix list %s is not newer than active %s; kept",
+                outcome.psl.version_raw, self._psl_holder.version_raw,
+            )
+            return False
+        try:
+            await self.db.put_cached_psl(
+                outcome.psl.version_raw or "", outcome.psl.commit,
+                outcome.psl.raw_text,
+            )
+        except Exception as e:  # noqa: BLE001 -- adoption already happened
+            # Persist failure is not a rollback: the newer list is already active
+            # and correct. The only cost is that a restart before the next
+            # successful fetch falls back to vendored.
+            self.log.warning("could not cache public suffix list: %s", e)
+        # A newer list can clear (or, after a floor bump, newly satisfy) the
+        # suffix-list halt. This is the second of the two callers -- the other is
+        # _apply_auto_config when min_psl_version moves.
+        self.policy.reevaluate_psl_floor()
+        return True
+
+    async def _governance_retry_loop(self) -> None:
+        """Re-read governance state until both halves land, then exit.
+
+        Scanning continues throughout -- results are still recorded, the queue
+        still drains -- but the policy layer stays halted, so nothing is written
+        to the list while we cannot see what is already on it. Exits (rather than
+        looping forever) once both reads succeed, because from then on the live
+        state-event handler keeps both current.
+
+        Only READ failures are retried. A successful read of an absent or
+        malformed auto_config returns True from refresh_auto_config: the bot stays
+        halted, but the fix is an operator edit and the state-event handler will
+        pick that up the moment it happens, so spinning here would only produce
+        an error line every 60s for a room that is legitimately mid-setup.
+        """
+        while True:
+            await asyncio.sleep(_GOVERNANCE_RETRY_SECONDS)
+            try:
+                rules_ok = await self.policy.load_rules()
+                config_ok = await self.policy.refresh_auto_config()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self.log.warning("governance resync error: %s", e)
+                continue
+            if rules_ok and config_ok:
+                self._governance_ok = True
+                self.log.info(
+                    "governance state resynced (%d rule(s) in fold); halted=%s",
+                    self.policy.active_rules(), self.policy.halted,
+                    extra={"csreg_event": "governance_resynced"},
+                )
+                return
+            self.log.error(
+                "governance resync failed; policy writes still halted (%s), "
+                "retrying in %ds", self.policy.halt_reason,
+                _GOVERNANCE_RETRY_SECONDS,
+                extra={"csreg_alarm": "governance_resync_failed",
+                       "reason": self.policy.halt_reason},
+            )
+
+    def _own_version(self) -> str | None:
+        """This plugin's version as a plain string, straight from maubot.yaml via
+        the loader metadata.
+
+        Two consumers: the MSC4133 profile advertisement below (so an operator can
+        SEE fleet versions) and policy.PolicyManager's min_bot_version floor (so
+        the operator can ENFORCE one). Both must read the same value or the
+        profile would advertise something different from what the gate compares.
+        The loader may hand back a packaging Version object rather than a str, so
+        stringify here and let the policy layer parse it.
+        """
+        meta = getattr(self, "loader", None)
+        version = getattr(getattr(meta, "meta", None), "version", None)
+        return str(version) if version else None
+
     async def _publish_version(self) -> None:
         """Best-effort: advertise this plugin's version in the bot's own Matrix
         profile via an MSC4133 custom profile field, so a list operator can see
@@ -276,17 +680,14 @@ class CSRegScanner(Plugin):
         The field name follows the Common Namespaced Identifier Grammar the 
         server enforces on custom fields.
         """
-        # Version comes straight from maubot.yaml via the loader metadata --
-        # single source of truth, no duplicated constant to drift.
-        meta = getattr(self, "loader", None)
-        version = getattr(getattr(meta, "meta", None), "version", None)
+        version = self._own_version()
         if not version:
             self.log.warning(
                 "could not determine plugin version; skipping profile publish",
                 extra={"csreg_alarm": "version_publish_no_version"},
             )
             return
-        version_str = str(version)
+        version_str = version
         try:
             await self.client.api.request(
                 Method.PUT,
@@ -478,7 +879,16 @@ class CSRegScanner(Plugin):
         auth = req.headers.get("Authorization", "")
         # Constant-time compare to avoid leaking the secret via timing. An empty
         # configured secret hard-fails closed (never treat "" as open).
-        if not secret or not hmac.compare_digest(auth, f"Bearer {secret}"):
+        #
+        # Compared as BYTES: hmac.compare_digest raises TypeError on str inputs
+        # containing non-ASCII, and aiohttp decodes header values as latin-1, so
+        # any raw byte >= 0x80 in the Authorization header used to reach it as a
+        # non-ASCII str and turn an unauthenticated request into a 500 with a
+        # traceback instead of a 401. surrogateescape round-trips whatever
+        # arrived without raising.
+        expected = f"Bearer {secret}".encode("utf-8")
+        provided = auth.encode("utf-8", "surrogateescape")
+        if not secret or not hmac.compare_digest(provided, expected):
             return Response(status=401)
         body = await req.text()
         # Accept JSON {"servers": [...]}, a bare JSON list, or whitespace-
@@ -747,23 +1157,44 @@ class CSRegScanner(Plugin):
         prev_name, prev_version = (
             record.previous_version if record.previous_version else (None, None)
         )
+        # A non-authoritative probe PRESERVES the stored pair (db.record_scan's
+        # CASE on fed_observed), so the row's value after this write is the
+        # previous one, not the probe's empty fields. Compute the stored pair
+        # once here and report THAT everywhere below.
+        stored_name = version.name if version.authoritative else prev_name
+        stored_version = version.version if version.authoritative else prev_version
         extra = {
             "csreg_event": "scan_result",
             "scan_target": scan_target,
             "reg_status": result.status,
             "previous_status": record.previous_status,
-            "fed_name": version.name,
-            "fed_version": version.version,
+            "fed_name": stored_name,
+            "fed_version": stored_version,
             "previous_fed_name": prev_name,
             "previous_fed_version": prev_version,
+            # The raw probe outcome, kept as separate fields so the distinction
+            # between "server reported nothing this scan" and "we have nothing
+            # stored" survives into the structured log.
+            "fed_probe_authoritative": version.authoritative,
+            "fed_probe_name": version.name,
+            "fed_probe_version": version.version,
         }
         # logfmt rendering of the version pair, shared by the change/unchanged
         # lines. A null name/version renders as "-" (kept out of the message as
         # the literal None so it can't collide with a real value).
+        #
+        # This reports the STORED pair, not the probe result. Rendering the
+        # probe's empty fields made a PRESERVED value look like it had been
+        # wiped: an `open -> unknown` transition logged "name=- version=-" even
+        # though the row still held Synapse/1.157.2 untouched. `version_probe=
+        # none` is appended in that case so the line says why the pair did not
+        # come from this scan, rather than silently implying it did.
         ver_kv = (
-            f"name={version.name if version.name is not None else '-'} "
-            f"version={version.version if version.version is not None else '-'}"
+            f"name={stored_name if stored_name is not None else '-'} "
+            f"version={stored_version if stored_version is not None else '-'}"
         )
+        if not version.authoritative:
+            ver_kv += " version_probe=none"
         # Version transition rendered as an old -> new pair, joined name/version
         # so "Synapse/1.96.0 -> Synapse/1.97.0" reads as one token per side. A
         # null side renders "-" (e.g. first authoritative sighting: "- -> ...").
@@ -812,6 +1243,16 @@ class CSRegScanner(Plugin):
         if result.ok and result.status is not None:
             # same shared policy-write path for scan + rescan
             await self.policy.reconcile(scan_target, result.status)
+            # Stale-entry cleanup runs AFTER reconcile, on the same result, so a
+            # target that just moved off `unknown` is reconciled normally and
+            # never considered stale in the same pass. status_since comes back
+            # from the write we already did, so this costs no extra query. The
+            # `scanned` row is deliberately left intact -- this is policy-list
+            # hygiene only, and the history is kept for stats. Each removal is
+            # recorded by the structured stale_cleanup log line.
+            await self.policy.consider_stale_cleanup(
+                scan_target, result.status, record.status_since
+            )
 
     # --- observability ----------------------------------------------------------
 
@@ -831,7 +1272,7 @@ class CSRegScanner(Plugin):
         """Demand in scans/sec to keep every bucket within its staleness T:
         sum(N_bucket / T_bucket). Shared by the capacity alarm and the rescan
         rate-meter so they can never disagree."""
-        default_t = self._staleness.get("unknown", 86400)
+        default_t = self._staleness.get("unknown", _DEFAULT_STALENESS_SECONDS)
         return sum(
             n / self._staleness.get(status, default_t)
             for status, n in buckets.items()
@@ -887,6 +1328,21 @@ class CSRegScanner(Plugin):
             "queue_depth": queue_depth,
             "active_rules": self.policy.active_rules(),
             "halted": self.policy.halted,
+            "cleanup_enabled": self.policy.cleanup_enabled,
+            "ban_cap_enabled": self.policy.max_bans_per_etld1 is not None,
+            "etld1s_at_cap": self.policy.etld1s_at_cap,
+            # Suffix-list state. Exposed HERE and only here -- deliberately NOT in
+            # the MSC4133 profile field. The profile is world-readable, and
+            # advertising which bot is running an outdated list tells an attacker
+            # exactly which one to aim unbounded bans at. The metrics endpoint is
+            # loopback-bound, so this stays moderator-visible.
+            "psl_version": (self._psl_holder.version_raw
+                            if self._psl_holder is not None else None),
+            "psl_source": (self._psl_holder.current.source
+                           if self._psl_holder is not None
+                           and self._psl_holder.current is not None else None),
+            "psl_min_version": self.policy.min_psl_version_raw,
+            "psl_floor_ok": not bool(self.policy._psl_halt_reason),
             "avg_scan": self._avg_scan,
             "inflight": len(self._inflight),
             "inflight_ceiling": self._max_inflight,
@@ -917,3 +1373,4 @@ class CSRegScanner(Plugin):
             "support_total": support_total,
             "support_reachable": support_reachable,
         }
+    

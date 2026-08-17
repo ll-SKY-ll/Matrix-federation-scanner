@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+    branches:
+      - dev
+
+jobs:
+  test:
+    runs-on: [debian-host]
+    env:
+      TEST_POSTGRES_DSN: ${{ secrets.CT_150_POSTGRES }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up virtualenv and install deps
+        working-directory: bot
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        working-directory: bot
+        env:
+          TEST_POSTGRES_DSN: ${{ secrets.CT_150_POSTGRES }}
+        run: |
+          echo "TEST_POSTGRES_DSN length: ${#TEST_POSTGRES_DSN}"
+          if [ -z "$TEST_POSTGRES_DSN" ]; then
+            echo "TEST_POSTGRES_DSN is empty in the pytest step — postgres tests will skip."
+            exit 1
+          fi
+          . .venv/bin/activate
+          pytest -v

@@ -4,6 +4,16 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import time
+
+
+def now() -> int:
+    """Current time as whole epoch seconds.
+
+    Lives here rather than in db.py so the policy layer can share one definition
+    of "now" without importing the DB module.
+    """
+    return int(time.time())
 
 
 def strip_port(server_name: str) -> str:
@@ -28,18 +38,51 @@ def strip_port(server_name: str) -> str:
     return s
 
 
-# IP-literal detection 
-_IP_LITERAL_V4 = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]+)?$")
-_IP_LITERAL_V6 = re.compile(r"^\[[0-9a-fA-F:]+\](?::[0-9]+)?$")
+# IP-literal detection, per the spec grammar (appendices, "Server Name"):
+#
+#   hostname    = IPv4address / "[" IPv6address "]" / dns-name
+#   IPv4address = 1*3DIGIT "." 1*3DIGIT "." 1*3DIGIT "." 1*3DIGIT   (octets 0..255)
+#   IPv6address = 2*45IPv6char
+#   IPv6char    = DIGIT / %x41-46 / %x61-66 / ":" / "."
+#
+# Two things the earlier regex-only version got wrong, in OPPOSITE directions:
+#
+#   * "." IS in the IPv6char set, so [::ffff:1.2.3.4] is a valid IPv6 literal.
+#     Rejecting it meant policy wrote a rule for it even with
+#     write_policies_for_ip_literals false (and then ran it through the PSL,
+#     tripping psl_unknown_tld).
+#   * an IPv4 literal's octets must be 0..255, so 999.999.999.999 is NOT a
+#     literal -- it satisfies dns-name (dns-char is DIGIT / ALPHA / "-" / ".")
+#     and is therefore a plain DNS name. Accepting it as a literal silently
+#     SUPPRESSED its policy write, i.e. failed open toward "not banned".
+#
+# Both edges are decided here now, so this predicate agrees with
+# resolver.parse_name on what is and is not a literal.
+_IP_LITERAL_V4 = re.compile(
+    r"^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(?::[0-9]{1,5})?$"
+)
+_IP_LITERAL_V6 = re.compile(r"^\[([0-9A-Fa-f:.]{2,45})\](?::[0-9]{1,5})?$")
 
 
 def is_ip_literal(host: str) -> bool:
     """
     True if `host` is a Matrix IP-literal server-name (v4 or bracketed v6),
-    with or without a port. 
+    with or without a port.
     """
     host = host.strip()
-    return bool(_IP_LITERAL_V4.match(host) or _IP_LITERAL_V6.match(host))
+    m4 = _IP_LITERAL_V4.match(host)
+    if m4:
+        return all(0 <= int(octet) <= 255 for octet in m4.groups())
+    m6 = _IP_LITERAL_V6.match(host)
+    if m6:
+        # Charset+length already gate the grammar (which forbids a scope id);
+        # the parser is what decides whether the remainder is a real address.
+        try:
+            ipaddress.IPv6Address(m6.group(1))
+            return True
+        except ValueError:
+            return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +90,7 @@ def is_ip_literal(host: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _PORT_RE = re.compile(r"^[0-9]{1,5}$")
+_IPV6_CHARS_RE = re.compile(r"^[0-9A-Fa-f:.]{2,45}$")
 _DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$")
 
 
@@ -62,10 +106,20 @@ def _valid_ipv4(host: str) -> bool:
 
 
 def _valid_ipv6_literal(host: str) -> bool:
+    """Bracketed IPv6 literal per the grammar (2*45 of DIGIT/A-F/a-f/":"/".").
+
+    The charset check runs FIRST and is load-bearing: ipaddress.IPv6Address
+    accepts a scope/zone id ("fe80::1%eth0"), but "%" is not an IPv6char, so
+    such a name is not a valid Matrix server name and must not validate.
+    """
     if not (host.startswith("[") and host.endswith("]")):
         return False
+    inner = host[1:-1]
+    if not _IPV6_CHARS_RE.match(inner):
+        return False
     try:
-        return isinstance(ipaddress.ip_address(host[1:-1]), ipaddress.IPv6Address)
+        ipaddress.IPv6Address(inner)
+        return True
     except ValueError:
         return False
 

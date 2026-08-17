@@ -26,12 +26,11 @@ policy granularity (domain).
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 from mautrix.util.async_db import Connection, Database, Scheme, UpgradeTable
 
-from .util import strip_port
+from .util import now, strip_port
 
 upgrade_table = UpgradeTable()
 
@@ -60,12 +59,24 @@ class ScanRecord:
     probe preserves the stored version, so it can never set this flag.
     ``previous_version`` is the prior (fed_name, fed_version) pair, or None when
     there was no prior row.
+
+    ``status_since`` is the epoch-seconds timestamp the STORED reg_status last
+    moved, i.e. exactly the value written to the column by this call: `ts` on a
+    first-ever row or a real transition, otherwise the preserved prior value.
+    Surfaced here so the stale-entry cleanup lane can age an `unknown` without a
+    second SELECT, for the same reason `changed`/`previous_status` are: the
+    comparison has already been made inside this transaction.
+
+    Note a task-failure preserves both the status AND its status_since, so a run
+    of failures does not reset the clock -- an entry that went unknown and stayed
+    unknown keeps ageing.
     """
 
     changed: bool
     previous_status: str | None
     version_changed: bool = False
     previous_version: tuple[str | None, str | None] | None = None
+    status_since: int | None = None
 
 # SQLite chunk size for the multi-row VALUES batch in enqueue. One bound
 # parameter per target, so this must stay well under SQLITE_MAX_VARIABLE_NUMBER
@@ -204,8 +215,55 @@ async def upgrade_v4(conn: Connection) -> None:
     )
 
 
-def now() -> int:
-    return int(time.time())
+@upgrade_table.register(
+    description="Add psl_cache table (last fetched public suffix list)"
+)
+async def upgrade_v5(conn: Connection) -> None:
+    """Exactly ONE row, holding the last successfully fetched suffix list.
+
+    A blob, not parsed rules in a table. Storing 10k rules relationally and
+    querying per lookup would be strictly worse on every axis that matters here:
+    public_suffix walks candidate suffixes longest-to-shortest, so one etld1 is
+    ~5 membership probes, and etld1s_at_cap runs that for every rule in the fold
+    on every metrics scrape -- thousands of row lookups per scrape to replace a
+    50ns set hit against 1.2 MiB of in-memory sets. It would also make the whole
+    suffix path async (breaking _covering_glob, _etld1_ban_count and the
+    etld1s_at_cap property, all synchronous today), and it would make live reload
+    HARDER: swapping a table needs a version column and a transaction so a
+    concurrent lookup cannot see a half-replaced list, where swapping an
+    in-memory object is one atomic attribute assignment.
+
+    What the blob IS for: surviving a restart during a publicsuffix.org outage.
+    Without it, a restart falls all the way back to the vendored copy and
+    discards a fresher list we already had, so the vendored copy would become a
+    routine fallback instead of a genuine last resort.
+
+      id          -- constant 1, with a CHECK so the table cannot grow a second
+                     row. Fixed single row means updates replace in place and
+                     there is nothing to prune (the reason a cache-eviction
+                     policy is absent rather than forgotten).
+      version_raw -- the header VERSION stamp, verbatim, e.g.
+                     "2026-07-25_14-20-03_UTC". Kept as TEXT rather than a
+                     timestamp so it round-trips byte-identically to what the
+                     list carries and to what an operator pastes into
+                     min_psl_version.
+      commit_hash -- header COMMIT, for provenance when diagnosing a bad list.
+      body        -- the raw .dat text (~325 KiB), stored uncompressed: TOAST
+                     compresses it out of line anyway, and keeping it as text
+                     means it can be inspected with a plain SELECT.
+      fetched_at  -- epoch seconds of the fetch that produced this row.
+    """
+    await conn.execute(
+        """
+        CREATE TABLE psl_cache (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            version_raw TEXT   NOT NULL,
+            commit_hash TEXT,
+            body        TEXT   NOT NULL,
+            fetched_at  BIGINT NOT NULL
+        )
+        """
+    )
 
 
 class DB:
@@ -338,11 +396,25 @@ class DB:
                 claimed = [r["scan_target"] for r in rows]
                 if claimed:
                     lease = ts + int(lease_seconds)
-                    for target in claimed:
+                    if self._db.scheme == Scheme.SQLITE:
+                        # No array type; one statement per row, as before.
+                        for target in claimed:
+                            await conn.execute(
+                                "UPDATE scan_queue SET leased_until = $1 "
+                                "WHERE scan_target = $2",
+                                lease,
+                                target,
+                            )
+                    else:
+                        # Postgres/Cockroach: one statement for the whole claim.
+                        # At rescan.batch_limit-sized batches this replaces up to
+                        # a couple hundred round-trips per tick with a single
+                        # planned UPDATE over an array-driven PK lookup.
                         await conn.execute(
-                            "UPDATE scan_queue SET leased_until = $1 WHERE scan_target = $2",
+                            "UPDATE scan_queue SET leased_until = $1 "
+                            "WHERE scan_target = ANY($2::text[])",
                             lease,
-                            target,
+                            claimed,
                         )
         return claimed
 
@@ -375,11 +447,28 @@ class DB:
         for status in staleness:
             if not status or not status.replace("_", "").isalnum():
                 raise ValueError(f"unsafe status key in staleness map: {status!r}")
-        cases = "\n".join(
-            f"WHEN reg_status = '{status}' THEN {int(t)}"
-            for status, t in staleness.items()
-        )
-        case_expr = f"(CASE {cases} ELSE {int(default_t)} END)"
+            if int(staleness[status]) <= 0:
+                # A non-positive T is a divide-by-zero (Postgres raises; SQLite
+                # silently yields NULL and destroys the ordering). The bot's
+                # sanitizer drops these at startup; refuse here too so no caller
+                # can hand us one.
+                raise ValueError(
+                    f"staleness for {status!r} must be > 0, got {staleness[status]!r}"
+                )
+        if staleness:
+            cases = "\n".join(
+                f"WHEN reg_status = '{status}' THEN {int(t)}"
+                for status, t in staleness.items()
+            )
+            case_expr = f"(CASE {cases} ELSE {int(default_t)} END)"
+        else:
+            # An EMPTY map has to degrade to the bare default, not to an empty
+            # CASE: "CASE  ELSE 86400 END" is a syntax error on both backends,
+            # and every rescan tick would have died on it (caught by the tick's
+            # broad except, so the loop just warned every interval and never
+            # rescanned anything again). Reachable whenever the operator empties
+            # the map or every key in it is a typo and gets dropped.
+            case_expr = str(int(default_t))
         ts = now()
         # ratio = (now - last_scan_at) * 1.0 / T  -- *1.0 forces float division.
         ratio_expr = f"(($1 - last_scan_at) * 1.0 / {case_expr})"
@@ -558,6 +647,52 @@ class DB:
             previous_status=prev_status,
             version_changed=version_changed,
             previous_version=prev_ver_pair,
+            status_since=status_since,
+        )
+
+    # --- public suffix list cache -------------------------------------------
+
+    async def get_cached_psl(self) -> tuple[str, str | None, str, int] | None:
+        """The cached list as (version_raw, commit_hash, body, fetched_at), or None.
+
+        Returning the raw body rather than a parsed object keeps psl.py's
+        validation the single place that decides whether text is usable: the
+        cached blob went through the gauntlet when it was fetched, but it is
+        re-validated on read anyway, because a row can outlive the code that
+        wrote it (a schema change, a hand-edited row, a restored backup).
+        """
+        row = await self._db.fetchrow(
+            "SELECT version_raw, commit_hash, body, fetched_at FROM psl_cache "
+            "WHERE id = 1"
+        )
+        if row is None:
+            return None
+        return (row["version_raw"], row["commit_hash"], row["body"],
+                row["fetched_at"])
+
+    async def put_cached_psl(
+        self, version_raw: str, commit_hash: str | None, body: str,
+        ts: int | None = None,
+    ) -> None:
+        """Replace the single cached row.
+
+        Unconditional overwrite: monotonicity is enforced in PSLHolder.adopt
+        BEFORE this is called, so anything reaching here is already known to be
+        newer than what was active. Duplicating that check in SQL would put the
+        ordering rule in two places and invite them to disagree.
+        """
+        ts = ts if ts is not None else now()
+        await self._db.execute(
+            """
+            INSERT INTO psl_cache (id, version_raw, commit_hash, body, fetched_at)
+            VALUES (1, $1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE SET
+                version_raw = excluded.version_raw,
+                commit_hash = excluded.commit_hash,
+                body        = excluded.body,
+                fetched_at  = excluded.fetched_at
+            """,
+            version_raw, commit_hash, body, ts,
         )
 
     async def statuses_for_domain(self, domain: str) -> list[tuple[str, str]]:
@@ -742,3 +877,4 @@ class DB:
         targets = int(row["targets"])
         scans = int(row["scans"])
         return targets, max(scans - targets, 0), scans
+    

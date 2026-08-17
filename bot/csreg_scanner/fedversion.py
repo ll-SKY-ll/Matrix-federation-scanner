@@ -36,7 +36,9 @@ from typing import Any, Optional
 
 import aiohttp
 
+from .ipfilter import IPRangePolicy, build_connector
 from .resolver import (
+    FederationTarget,
     ServerResolver,
     build_timeout,
     read_json_capped,
@@ -113,6 +115,7 @@ class FederationVersionProbe:
         client: aiohttp.ClientSession,
         log: logging.Logger,
         pool_limit: Optional[int] = None,
+        ip_policy: Optional[IPRangePolicy] = None,
     ) -> None:
         self.log = log
         # The injected client carries the connection pool / headers we want, but
@@ -130,12 +133,20 @@ class FederationVersionProbe:
         # (standalone/CLI use, no admission gate) aiohttp's own default of 100
         # is kept.
         self._resolver = ServerResolver(client)
+        #
+        # ip_policy: this session is the one MOST in need of the address filter.
+        # It connects to whatever host:port the target's own well-known named
+        # The filter lives on the connector's resolver, so it applies to the 
+        # resolved addresses rather than the name, and therefore also to a DNS 
+        # name pointing at RFC1918.
         self._verify_off = aiohttp.ClientSession(
             headers={
                 "User-Agent": "csreg-scanner (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
                 "Accept": "application/json",
             },
-            connector=aiohttp.TCPConnector(
+            connector=build_connector(
+                ip_policy,
+                log,
                 ssl=False,  # relaxed: recon only (see module docstring)
                 limit=pool_limit if pool_limit is not None else 100,
             ),
@@ -153,40 +164,62 @@ class FederationVersionProbe:
 
         The full scan_target (including any port) is fed to the federation
         resolver as-is -- the port is load-bearing.
+
+        Candidates are tried in RFC 2782 order and the walk advances ONLY on a
+        transport failure (connect refused/timeout, TLS error, blocked address).
+        Any HTTP response -- including a 404 or a 502 -- ends the walk, because
+        it proves we reached the endpoint the name pointed at; retrying a backup
+        SRV target at that point would be asking a different server the same
+        question and taking whichever answer we liked better. Non-SRV branches
+        yield exactly one candidate, so for them this is the old single-shot
+        behaviour verbatim.
         """
         try:
-            target = await self._resolver.resolve(scan_target)
+            targets = await self._resolver.resolve_candidates(scan_target)
         except Exception as e:  # noqa: BLE001 -- resolver shouldn't raise, but never let it
             self.log.debug("fedversion resolve(%s) failed: %s", scan_target, e)
             return FederationVersion.no_signal()
 
-        # Build the connect URL from the resolved federation target. host may be
-        # a bare IPv6 literal (resolver strips brackets); re-bracket for the URL.
+        last_error: Optional[BaseException] = None
+        for index, target in enumerate(targets):
+            url = self._version_url(target)
+            # Honor the federation Host header (delegated/original name, per branch).
+            headers = {"Host": target.host_header}
+            try:
+                async with self._verify_off.get(
+                    url,
+                    headers=headers,
+                    timeout=build_timeout(_VERSION_READ_TIMEOUT),
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status != 200:
+                        return FederationVersion.no_signal()
+                    body = await read_json_capped(resp)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = e
+                remaining = len(targets) - index - 1
+                self.log.debug(
+                    "fedversion probe(%s) http error on %s:%d (%d candidate(s) "
+                    "left): %s", scan_target, target.host, target.port, remaining, e,
+                )
+                continue
+            return self._interpret(body)
+
+        if last_error is not None:
+            self.log.debug(
+                "fedversion probe(%s): all %d candidate(s) unreachable, last "
+                "error: %s", scan_target, len(targets), last_error,
+            )
+        return FederationVersion.no_signal()
+
+    @staticmethod
+    def _version_url(target: FederationTarget) -> str:
+        """Connect URL for one resolved federation target. ``host`` may be a bare
+        IPv6 literal (the resolver strips brackets); re-bracket for the URL."""
         host = target.host
         if ":" in host and not host.startswith("["):
-            url_host = f"[{host}]"
-        else:
-            url_host = host
-        url = f"https://{url_host}:{target.port}/_matrix/federation/v1/version"
-
-        # Honor the federation Host header (delegated/original name, per branch).
-        headers = {"Host": target.host_header}
-
-        try:
-            async with self._verify_off.get(
-                url,
-                headers=headers,
-                timeout=build_timeout(_VERSION_READ_TIMEOUT),
-                allow_redirects=False,
-            ) as resp:
-                if resp.status != 200:
-                    return FederationVersion.no_signal()
-                body = await read_json_capped(resp)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            self.log.debug("fedversion probe(%s) http error: %s", scan_target, e)
-            return FederationVersion.no_signal()
-
-        return self._interpret(body)
+            host = f"[{host}]"
+        return f"https://{host}:{target.port}/_matrix/federation/v1/version"
 
     @staticmethod
     def _interpret(body: object) -> FederationVersion:
@@ -209,3 +242,4 @@ class FederationVersionProbe:
         name = _truncate_field(server.get("name"))
         version = _truncate_field(server.get("version"))
         return FederationVersion(True, name, version)
+    

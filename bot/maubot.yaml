@@ -1,6 +1,6 @@
 maubot: 0.5.0
 id: net.codestorm.csreg-scanner
-version: 0.1.12
+version: 0.2.0
 license: MIT
 modules:
   - csreg_scanner
@@ -19,3 +19,6 @@ extra_files:
   - base-config.yaml
   # Web based config value calculator
   - csreg_scanner/web/calc.html
+  # Vendored Public Suffix List (MPL 2.0) for the per-eTLD+1 ban cap.
+  - csreg_scanner/public_suffix_list.dat
+  

@@ -10,6 +10,8 @@ _LEAVES = [
     "auto_config_event_type",
     "scanner.timeout_seconds",
     "scanner.fetch_support",
+    "scanner.ip_range_blacklist",
+    "scanner.ip_range_whitelist",
     "queue.scan_interval_seconds",
     "queue.scan_batch_limit",
     "rescan.interval_seconds",
@@ -25,6 +27,7 @@ _LEAVES = [
     "sources.webhook.enabled",
     "sources.webhook.secret",
     "policy.max_writes_per_second",
+    "policy.psl_auto_update",
     "metrics.enabled",
     "metrics.expose_per_server",
     "metrics.listen_host",
@@ -38,3 +41,4 @@ class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         for leaf in _LEAVES:
             helper.copy(leaf)
+            

@@ -40,6 +40,7 @@ from typing import Any, Optional
 import aiohttp
 import yarl
 
+from .ipfilter import IPRangePolicy, build_connector
 from .resolver import (
     ClientResolver,
     build_timeout,
@@ -385,13 +386,16 @@ class Scanner:
         client: Optional[aiohttp.ClientSession] = None,
         pool_limit: Optional[int] = None,
         fetch_support: bool = True,
+        ip_policy: Optional[IPRangePolicy] = None,
     ) -> None:
         self.timeout = timeout
         self.log = log
         # A shared client should be injected by the bot and closed by it. When
-        # none is given (standalone/CLI use) we own a private one.
+        # none is given (standalone/CLI use) we own a private one -- and then the
+        # address filter has to be installed here, since there is no bot-built
+        # connector to inherit it from.
         self._owns_client = client is None
-        self.client = client or self._build_client()
+        self.client = client or self._build_client(ip_policy, log)
         self._checker = RegistrationChecker(self.client, log)
         # Federation version probe. It keeps its OWN verify-disabled aiohttp
         # session internally (regcheck's client verifies TLS; the version probe
@@ -399,7 +403,9 @@ class Scanner:
         # self.client. pool_limit (the bot's scan-admission ceiling) is threaded
         # through so the probe's private connection pool is sized to the same
         # ceiling and can never become a second, silent concurrency limiter.
-        self._version = FederationVersionProbe(self.client, log, pool_limit=pool_limit)
+        self._version = FederationVersionProbe(
+            self.client, log, pool_limit=pool_limit, ip_policy=ip_policy
+        )
         # Support well-known fetcher (config-gated via fetch_support). Plain
         # origin HTTPS on the SHARED verifying session -- it borrows the same
         # pool an in-flight scan already holds a slot in, so it adds no second
@@ -408,12 +414,18 @@ class Scanner:
         self._support = SupportInfoProbe(self.client, log)
 
     @staticmethod
-    def _build_client() -> aiohttp.ClientSession:
+    def _build_client(
+        ip_policy: Optional[IPRangePolicy] = None,
+        log: Optional[logging.Logger] = None,
+    ) -> aiohttp.ClientSession:
         return aiohttp.ClientSession(
             headers={
                 "User-Agent": "csreg-scanner (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
                 "Accept": "application/json",
             },
+            connector=build_connector(
+                ip_policy, log or logging.getLogger(__name__)
+            ),
             timeout=build_timeout(_PROBE_READ_TIMEOUT),
             trust_env=False,  # no ambient proxy/env surprises in a scanner
         )
@@ -451,7 +463,8 @@ class Scanner:
 
         Never raises; failures of any phase are captured in the returned values.
         """
-        t0 = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
         try:
             status = await asyncio.wait_for(
                 self._checker.classify(scan_target), timeout=self.timeout
@@ -470,7 +483,7 @@ class Scanner:
 
         # Version probe under the REMAINING budget. Skip if none is left.
         version = FederationVersion.no_signal()
-        remaining = self.timeout - (asyncio.get_event_loop().time() - t0)
+        remaining = self.timeout - (loop.time() - t0)
         if remaining > 0:
             try:
                 version = await asyncio.wait_for(
@@ -484,7 +497,7 @@ class Scanner:
         # Support well-known fetch under what is STILL left, gated on config.
         support = SupportInfo.no_signal()
         if self.fetch_support:
-            remaining = self.timeout - (asyncio.get_event_loop().time() - t0)
+            remaining = self.timeout - (loop.time() - t0)
             if remaining > 0:
                 try:
                     support = await asyncio.wait_for(

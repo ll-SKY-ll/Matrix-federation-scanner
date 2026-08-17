@@ -227,110 +227,140 @@ class ServerResolver:
         self.dns = dns_resolver or dns.asyncresolver.Resolver()
 
     async def resolve(self, server_name: str) -> FederationTarget:
+        """The single preferred federation target (first candidate).
+
+        Kept for callers that only want one -- the CLI's resolution display.
+        Anything that CONNECTS should use resolve_candidates() so a dead
+        primary SRV target can fall through to its backups.
+        """
+        return (await self.resolve_candidates(server_name))[0]
+
+    async def resolve_candidates(self, server_name: str) -> list[FederationTarget]:
+        """Every federation target to try, in the order to try them.
+
+        Only the SRV branches (steps 3c and 4) can yield more than one: RFC 2782
+        defines a priority/weight ORDER over the record set, and a client is
+        expected to walk it until one target connects. The previous code picked a
+        single record and never fell back, so a server whose primary SRV target
+        was down classified as `unknown` forever even with a healthy backup
+        record -- and, if it was banned, stale cleanup would eventually drop its
+        rule on the strength of that `unknown`.
+
+        The non-SRV branches are single-candidate BY SPEC, not by simplification:
+        an IP literal, an explicit port, or a bare name on :8448 name exactly one
+        endpoint, and there is nothing to fall back to. In particular a plain
+        :8448 is NOT appended after an SRV list -- if SRV records exist, they are
+        the answer.
+        """
         parsed = parse_name(server_name)
 
         # Step 1: IP literal -> use directly (cert validated against the IP).
         if parsed.is_ip_literal:
-            return FederationTarget(
+            return [FederationTarget(
                 host=parsed.host,
                 port=parsed.port or DEFAULT_FEDERATION_PORT,
                 host_header=_host_header(parsed.host_with_brackets, parsed.port),
                 tls_server_name=None,
                 resolution_method=ResolutionMethod.IP_LITERAL,
-            )
+            )]
 
         # Step 2: hostname with explicit port -> use directly, no well-known/SRV.
         if parsed.port is not None:
-            return FederationTarget(
+            return [FederationTarget(
                 host=parsed.host,
                 port=parsed.port,
                 host_header=_host_header(parsed.host, parsed.port),
                 tls_server_name=parsed.host,
                 resolution_method=ResolutionMethod.EXPLICIT_PORT,
-            )
+            )]
 
         # Step 3: no port -> well-known delegation, attempted BEFORE SRV and
         # short-circuiting it.
         m_server = await self._fetch_well_known_server(parsed.host)
         if m_server is not None:
             delegated = await self._resolve_delegated(m_server)
-            if delegated is not None:
+            if delegated:
                 return delegated
             # A malformed m.server value falls through to SRV on the original
             # name, matching the "well-known error -> step 4" behaviour.
 
         # Step 4: SRV on the original hostname.
         srv = await self._srv_lookup(parsed.host)
-        if srv is not None:
-            target, port = srv
-            return FederationTarget(
-                host=target,
-                port=port,
-                host_header=parsed.host,            # original name, no port
-                tls_server_name=parsed.host,
-                resolution_method=ResolutionMethod.SRV,
-            )
+        if srv:
+            return [
+                FederationTarget(
+                    host=target,
+                    port=port,
+                    host_header=parsed.host,        # original name, no port
+                    tls_server_name=parsed.host,
+                    resolution_method=ResolutionMethod.SRV,
+                )
+                for target, port in srv
+            ]
 
         # Step 5: plain hostname on the default port.
-        return FederationTarget(
+        return [FederationTarget(
             host=parsed.host,
             port=DEFAULT_FEDERATION_PORT,
             host_header=parsed.host,
             tls_server_name=parsed.host,
             resolution_method=ResolutionMethod.PLAIN,
-        )
+        )]
 
-    async def _resolve_delegated(self, m_server: str) -> Optional[FederationTarget]:
+    async def _resolve_delegated(self, m_server: str) -> list[FederationTarget]:
         """Resolve the ``m.server`` delegated name (step 3 sub-branches).
 
-        Host header / SNI are derived from the *delegated* name. Returns None if
-        the value is unparseable (caller then falls through to SRV).
+        Host header / SNI are derived from the *delegated* name. Returns an EMPTY
+        list if the value is unparseable (caller then falls through to SRV on the
+        original name).
         """
         try:
             d = parse_name(m_server)
         except ValueError:
-            return None
+            return []
 
         # 3a: delegated name is an IP literal.
         if d.is_ip_literal:
-            return FederationTarget(
+            return [FederationTarget(
                 host=d.host,
                 port=d.port or DEFAULT_FEDERATION_PORT,
                 host_header=_host_header(d.host_with_brackets, d.port),
                 tls_server_name=None,
                 resolution_method=ResolutionMethod.WELL_KNOWN_IP,
-            )
+            )]
 
         # 3b: delegated name has an explicit port.
         if d.port is not None:
-            return FederationTarget(
+            return [FederationTarget(
                 host=d.host,
                 port=d.port,
                 host_header=_host_header(d.host, d.port),
                 tls_server_name=d.host,
                 resolution_method=ResolutionMethod.WELL_KNOWN_PORT,
-            )
+            )]
 
         # 3c: delegated name, no port -> SRV on the delegated name.
         srv = await self._srv_lookup(d.host)
-        if srv is not None:
-            target, port = srv
-            return FederationTarget(
-                host=target,
-                port=port,
-                host_header=d.host,                 # delegated name, no port
-                tls_server_name=d.host,
-                resolution_method=ResolutionMethod.WELL_KNOWN_SRV,
-            )
+        if srv:
+            return [
+                FederationTarget(
+                    host=target,
+                    port=port,
+                    host_header=d.host,             # delegated name, no port
+                    tls_server_name=d.host,
+                    resolution_method=ResolutionMethod.WELL_KNOWN_SRV,
+                )
+                for target, port in srv
+            ]
 
         # 3d: delegated name, no port, no SRV -> plain on the default port.
-        return FederationTarget(
+        return [FederationTarget(
             host=d.host,
             port=DEFAULT_FEDERATION_PORT,
             host_header=d.host,
             tls_server_name=d.host,
             resolution_method=ResolutionMethod.WELL_KNOWN_PLAIN,
-        )
+        )]
 
     async def _fetch_well_known_server(self, hostname: str) -> Optional[str]:
         """Fetch /.well-known/matrix/server, return ``m.server`` or None.
@@ -359,15 +389,21 @@ class ServerResolver:
             return None
         return m_server.strip()
 
-    async def _srv_lookup(self, hostname: str) -> Optional[tuple[str, int]]:
-        """SRV lookup: modern ``_matrix-fed._tcp`` then deprecated ``_matrix._tcp``."""
-        for service in (f"_matrix-fed._tcp.{hostname}", f"_matrix._tcp.{hostname}"):
-            target = await self._query_srv(service)
-            if target is not None:
-                return target
-        return None
+    async def _srv_lookup(self, hostname: str) -> list[tuple[str, int]]:
+        """SRV lookup: modern ``_matrix-fed._tcp`` then deprecated ``_matrix._tcp``.
 
-    async def _query_srv(self, qname: str) -> Optional[tuple[str, int]]:
+        Returns ALL usable records in RFC 2782 try-order, not just the winner.
+        The first service name that yields a usable answer wins outright -- an
+        answer on ``_matrix-fed._tcp`` is never merged with, or supplemented by,
+        the deprecated name.
+        """
+        for service in (f"_matrix-fed._tcp.{hostname}", f"_matrix._tcp.{hostname}"):
+            targets = await self._query_srv(service)
+            if targets:
+                return targets
+        return []
+
+    async def _query_srv(self, qname: str) -> list[tuple[str, int]]:
         try:
             answers = await self.dns.resolve(qname, "SRV")
         except DNSException:
@@ -377,34 +413,70 @@ class ServerResolver:
             # fall through to the next resolution step. DNSException is the
             # stable public base (dns.exception), so this avoids coupling to
             # version-specific re-exports on dns.asyncresolver.
-            return None
+            return []
 
         records = list(answers)
         if not records:
-            return None
+            return []
 
-        # Lowest priority wins; among equal priority, choose by weight (RFC 2782).
-        best_priority = min(r.priority for r in records)
-        candidates = [r for r in records if r.priority == best_priority]
-        chosen = _weighted_choice(candidates)
+        out: list[tuple[str, int]] = []
+        for record in _order_srv(records):
+            target = str(record.target).rstrip(".")
+            if not target or target == ".":
+                # RFC 2782's explicit "no service offered" pseudo-target. Drop it
+                # rather than aborting: if it was the ONLY record the list comes
+                # back empty and the caller falls through, which is the same
+                # behaviour as before.
+                continue
+            out.append((target, record.port))
+        return out
 
-        target = str(chosen.target).rstrip(".")
-        if not target or target == ".":  # explicit "no service offered"
-            return None
-        return target, chosen.port
+
+def _order_srv(records: list) -> list:
+    """Order an SRV record set per RFC 2782: ascending priority, and within each
+    priority band, repeated weighted selection WITHOUT replacement.
+
+    Selection without replacement is what makes this an order rather than a
+    single pick: every record in a band appears exactly once, and a record's
+    weight determines how likely it is to appear EARLY, not whether it appears
+    at all. That is the property the fallback walk needs -- a weight-0 backup
+    must still be reachable once the weighted primaries have been tried.
+    """
+    by_priority: dict[int, list] = {}
+    for record in records:
+        by_priority.setdefault(record.priority, []).append(record)
+    ordered: list = []
+    for priority in sorted(by_priority):
+        band = list(by_priority[priority])
+        while band:
+            # pop by INDEX, not by value: SRV rdata compares by field, so two
+            # identical records would make a remove()-by-value ambiguous.
+            ordered.append(band.pop(_weighted_pick_index(band)))
+    return ordered
 
 
-def _weighted_choice(records: list):
+def _weighted_pick_index(records: list) -> int:
+    """RFC 2782 weighted pick within one priority band; returns an index.
+
+    ``pick < upto`` is strict on purpose. random.uniform(0, total) is INCLUSIVE
+    of 0, so under the old ``pick <= upto`` a zero-weight record sitting on a
+    cumulative boundary (in particular a weight-0 record in first position, with
+    upto still 0) could win a lottery it holds no tickets in -- a zero-length
+    segment being hit because the comparison treated its closed left edge as
+    inside it. Strict comparison makes a zero-weight record unreachable while any
+    positive weight remains, and the trailing return covers pick == total.
+    """
     total = sum(r.weight for r in records)
     if total == 0:
-        return random.choice(records)
+        # All-zero band: the RFC leaves this undefined, so treat them as equals.
+        return random.randrange(len(records))
     pick = random.uniform(0, total)
     upto = 0
-    for r in records:
-        upto += r.weight
-        if pick <= upto:
-            return r
-    return records[-1]
+    for i, record in enumerate(records):
+        upto += record.weight
+        if pick < upto:
+            return i
+    return len(records) - 1
 
 
 # --------------------------------------------------------------------------- #

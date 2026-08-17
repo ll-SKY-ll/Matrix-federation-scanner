@@ -1,0 +1,113 @@
+name: Sync release to GitHub
+
+on:
+  release:
+    types:
+      - published
+      - edited
+
+jobs:
+  sync:
+    runs-on: [debian-host]
+
+    steps:
+      - name: Resolve release metadata from event payload
+        id: meta
+        run: |
+          set -euo pipefail
+          ACTION=$(python3 -c "import json,os;print(json.load(open(os.environ['GITHUB_EVENT_PATH']))['action'])")
+          TAG=$(python3 -c "import json,os;print(json.load(open(os.environ['GITHUB_EVENT_PATH']))['release']['tag_name'])")
+          NAME=$(python3 -c "import json,os;r=json.load(open(os.environ['GITHUB_EVENT_PATH']))['release'];print(r.get('name') or r['tag_name'])")
+          python3 -c "import json,os;r=json.load(open(os.environ['GITHUB_EVENT_PATH']))['release'];open('release-notes.md','w',encoding='utf-8').write(r.get('body') or '')"
+          echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}"     >> "$GITHUB_OUTPUT"
+          echo "Action: ${ACTION}"; echo "Tag: ${TAG}"; echo "Name: ${NAME}"
+          echo "----- release notes -----"; cat release-notes.md; echo "-------------------------"
+
+      - name: Force Forgejo->GitHub mirror sync and wait for tag
+        env:
+          FORGE_TOKEN: ${{ secrets.MIRROR_SYNC_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_REPO: ll-SKY-ll/Matrix-federation-scanner
+          FORGEJO_REPO: Sky/cs-openreg
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "Triggering push-mirror sync on Forgejo (${FORGEJO_REPO})..."
+          curl -fsS -X POST \
+            -H "Authorization: token ${FORGE_TOKEN}" \
+            "${GITHUB_SERVER_URL}/api/v1/repos/${FORGEJO_REPO}/mirror-sync"
+
+          echo "Waiting for tag ${TAG} to appear on GitHub (${GH_REPO})..."
+          for i in $(seq 1 30); do
+            if gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Tag ${TAG} present on GitHub after ${i} attempt(s)."
+              break
+            fi
+            if [ "${i}" -eq 30 ]; then
+              echo "ERROR: tag ${TAG} did not appear on GitHub within timeout." >&2
+              exit 1
+            fi
+            echo "  not yet (attempt ${i}/30), sleeping 10s..."
+            sleep 10
+          done
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Build .mbp (published only)
+        if: steps.meta.outputs.action == 'published'
+        env:
+          VERSION: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          OUTPUT="${GITHUB_WORKSPACE}/cs_openreg-${VERSION}.mbp"
+          cd bot
+          zip -r "${OUTPUT}" \
+            csreg_scanner \
+            base-config.yaml \
+            maubot.yaml \
+            -x '*__pycache__*' \
+            -x '*.pyc'
+          echo "Built:"; ls -lh "${OUTPUT}"
+
+      - name: Sync to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_REPO: ll-SKY-ll/Matrix-federation-scanner
+          ACTION: ${{ steps.meta.outputs.action }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          MBP="cs_openreg-${TAG}.mbp"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then EXISTS=1; else EXISTS=0; fi
+          echo "GitHub release for ${TAG} exists: ${EXISTS}"
+
+          if [ "${ACTION}" = "published" ]; then
+            if [ "${EXISTS}" -eq 1 ]; then
+              gh release edit "${TAG}" --title "${NAME}" --notes-file release-notes.md --latest
+              gh release upload "${TAG}" "${MBP}" --clobber
+            else
+              gh release create "${TAG}" "${MBP}" --title "${NAME}" --notes-file release-notes.md --latest
+            fi
+
+          elif [ "${ACTION}" = "edited" ]; then
+            if [ "${EXISTS}" -eq 1 ]; then
+              echo "Edit: syncing notes/title only, asset untouched."
+              gh release edit "${TAG}" --title "${NAME}" --notes-file release-notes.md
+            else
+              echo "Edit but no GitHub release yet -> upsert (build + create)."
+              OUTPUT="${GITHUB_WORKSPACE}/${MBP}"
+              ( cd bot && zip -r "${OUTPUT}" csreg_scanner base-config.yaml maubot.yaml -x '*__pycache__*' -x '*.pyc' )
+              ls -lh "${OUTPUT}"
+              gh release create "${TAG}" "${MBP}" --title "${NAME}" --notes-file release-notes.md --latest
+            fi
+          else
+            echo "Unhandled action '${ACTION}' - nothing to do."
+          fi

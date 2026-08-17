@@ -163,7 +163,16 @@ class PostgresSource:
             await self.connect()
         if self._pool is None:  # connect() failed to populate it
             raise RuntimeError("postgres pool unavailable")
-        rows = await self._pool.fetch(self.query)
+        # Read-only transaction as the enforced half of the SELECT-only promise.
+        # _is_select_only is a shape check and cannot catch a data-modifying CTE
+        # (WITH x AS (INSERT ... RETURNING) SELECT ...) -- that matches
+        # WITH...SELECT and always did. A read-only transaction makes the DB
+        # refuse the write regardless of how the statement is spelled, which is
+        # the guarantee the docstring claims. The dedicated SELECT-only role is
+        # still the real boundary; this is defence in depth that costs nothing.
+        async with self._pool.acquire() as conn:
+            async with conn.transaction(readonly=True):
+                rows = await conn.fetch(self.query)
         # Edge validation (defense in depth): the central _clean gate in bot.py
         # is the authority, but drop anything here that isn't a valid Matrix
         # server name so a stray non-name row (NULL, a numeric id, a label) is

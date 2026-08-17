@@ -242,6 +242,33 @@ class MetricsServer:
                snap["active_rules"])
         _gauge(out, "csreg_halted", "1 if policy writes are halted (fail-closed)",
                1 if snap["halted"] else 0)
+        _gauge(out, "csreg_stale_cleanup_enabled",
+               "1 if this bot is an authorised stale-entry cleaner with a "
+               "configured stale_max_age",
+               1 if snap["cleanup_enabled"] else 0)
+        _gauge(out, "csreg_ban_cap_enabled",
+               "1 if a per-eTLD+1 ban cap (max_bans_per_etld1) is configured",
+               1 if snap["ban_cap_enabled"] else 0)
+        _gauge(out, "csreg_etld1s_at_cap",
+               "Registrable domains (eTLD+1) currently at/over the ban cap; "
+               "nonzero means new bans under them are being refused",
+               snap["etld1s_at_cap"])
+        # Suffix-list freshness. version/source are LABELS on a constant-1 gauge
+        # (the standard build-info shape) because the value is a string; the
+        # cardinality is 1 per bot and only changes when a new list is adopted.
+        psl_version = snap.get("psl_version")
+        if psl_version:
+            out.append("# HELP csreg_psl_info Active public suffix list "
+                       "(value is always 1; read the labels)")
+            out.append("# TYPE csreg_psl_info gauge")
+            out.append(
+                f'csreg_psl_info{{version="{_esc_label(psl_version)}",'
+                f'source="{_esc_label(str(snap.get("psl_source") or "unknown"))}"}} 1'
+            )
+        _gauge(out, "csreg_psl_floor_satisfied",
+               "1 if the active public suffix list satisfies min_psl_version "
+               "(0 means policy writes are halted on the version floor)",
+               1 if snap.get("psl_floor_ok", True) else 0)
         _gauge(out, "csreg_scan_duration_seconds_avg",
                "EWMA of single-server scan duration", round(snap["avg_scan"], 4))
         # The 'am I digging my own grave' signal.
@@ -323,3 +350,4 @@ def _gauge(out: list[str], name: str, help_text: str, value) -> None:
     out.append(f"# HELP {name} {help_text}")
     out.append(f"# TYPE {name} gauge")
     out.append(f"{name} {value}")
+    
