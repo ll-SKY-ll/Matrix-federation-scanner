@@ -27,14 +27,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
 
-      - name: Resolve commit SHA for the tag
-        id: sha
+      - name: Push tag to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_REPO: ll-SKY-ll/Matrix-federation-scanner
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -euo pipefail
-          SHA=$(git rev-parse HEAD)
-          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "Tag ${{ steps.meta.outputs.tag }} -> commit ${SHA}"
+          git config --global --add safe.directory "$(pwd)" || true
+          set +x
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
+          git push "${REMOTE_URL}" "refs/tags/${TAG}" 2>&1 | sed -e "s/${GH_TOKEN}/***/g" || {
+            echo "Tag push failed (it may already exist on GitHub, which is fine)."
+          }
+          echo "Tag ${TAG} pushed (or already present) on GitHub."
 
       - name: Build .mbp (published only)
         if: steps.meta.outputs.action == 'published'
@@ -59,13 +68,9 @@ jobs:
           ACTION: ${{ steps.meta.outputs.action }}
           TAG: ${{ steps.meta.outputs.tag }}
           NAME: ${{ steps.meta.outputs.name }}
-          SHA: ${{ steps.sha.outputs.sha }}
         run: |
           set -euo pipefail
 
-          # Regenerate the notes file here, in the same step that consumes it,
-          # from the event payload. Written to RUNNER_TEMP so nothing (e.g. a
-          # checkout) can clobber it, and no cross-step path assumptions.
           export NOTES="${RUNNER_TEMP}/release-notes.md"
           python3 -c "import json,os;r=json.load(open(os.environ['GITHUB_EVENT_PATH']))['release'];open(os.environ['NOTES'],'w',encoding='utf-8').write(r.get('body') or '')"
           echo "----- release notes -----"; cat "${NOTES}"; echo; echo "-------------------------"
@@ -80,7 +85,7 @@ jobs:
               gh release edit "${TAG}" --title "${NAME}" --notes-file "${NOTES}" --latest
               gh release upload "${TAG}" "${MBP}" --clobber
             else
-              gh release create "${TAG}" "${MBP}" --target "${SHA}" --title "${NAME}" --notes-file "${NOTES}" --latest
+              gh release create "${TAG}" "${MBP}" --title "${NAME}" --notes-file "${NOTES}" --latest
             fi
 
           elif [ "${ACTION}" = "edited" ]; then
@@ -92,7 +97,7 @@ jobs:
               OUTPUT="${GITHUB_WORKSPACE}/${MBP}"
               ( cd bot && zip -r "${OUTPUT}" csreg_scanner base-config.yaml maubot.yaml -x '*__pycache__*' -x '*.pyc' )
               ls -lh "${OUTPUT}"
-              gh release create "${TAG}" "${MBP}" --target "${SHA}" --title "${NAME}" --notes-file "${NOTES}" --latest
+              gh release create "${TAG}" "${MBP}" --title "${NAME}" --notes-file "${NOTES}" --latest
             fi
           else
             echo "Unhandled action '${ACTION}' - nothing to do."
