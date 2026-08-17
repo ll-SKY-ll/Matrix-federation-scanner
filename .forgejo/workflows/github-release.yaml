@@ -18,12 +18,10 @@ jobs:
           ACTION=$(python3 -c "import json,os;print(json.load(open(os.environ['GITHUB_EVENT_PATH']))['action'])")
           TAG=$(python3 -c "import json,os;print(json.load(open(os.environ['GITHUB_EVENT_PATH']))['release']['tag_name'])")
           NAME=$(python3 -c "import json,os;r=json.load(open(os.environ['GITHUB_EVENT_PATH']))['release'];print(r.get('name') or r['tag_name'])")
-          python3 -c "import json,os;r=json.load(open(os.environ['GITHUB_EVENT_PATH']))['release'];open('release-notes.md','w',encoding='utf-8').write(r.get('body') or '')"
           echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
           echo "name=${NAME}"     >> "$GITHUB_OUTPUT"
           echo "Action: ${ACTION}"; echo "Tag: ${TAG}"; echo "Name: ${NAME}"
-          echo "----- release notes -----"; cat release-notes.md; echo "-------------------------"
 
       - name: Checkout release tag
         uses: actions/checkout@v4
@@ -64,6 +62,14 @@ jobs:
           SHA: ${{ steps.sha.outputs.sha }}
         run: |
           set -euo pipefail
+
+          # Regenerate the notes file here, in the same step that consumes it,
+          # from the event payload. Written to RUNNER_TEMP so nothing (e.g. a
+          # checkout) can clobber it, and no cross-step path assumptions.
+          export NOTES="${RUNNER_TEMP}/release-notes.md"
+          python3 -c "import json,os;r=json.load(open(os.environ['GITHUB_EVENT_PATH']))['release'];open(os.environ['NOTES'],'w',encoding='utf-8').write(r.get('body') or '')"
+          echo "----- release notes -----"; cat "${NOTES}"; echo; echo "-------------------------"
+
           MBP="cs_openreg-${TAG}.mbp"
 
           if gh release view "${TAG}" >/dev/null 2>&1; then EXISTS=1; else EXISTS=0; fi
@@ -71,22 +77,22 @@ jobs:
 
           if [ "${ACTION}" = "published" ]; then
             if [ "${EXISTS}" -eq 1 ]; then
-              gh release edit "${TAG}" --title "${NAME}" --notes-file release-notes.md --latest
+              gh release edit "${TAG}" --title "${NAME}" --notes-file "${NOTES}" --latest
               gh release upload "${TAG}" "${MBP}" --clobber
             else
-              gh release create "${TAG}" "${MBP}" --target "${SHA}" --title "${NAME}" --notes-file release-notes.md --latest
+              gh release create "${TAG}" "${MBP}" --target "${SHA}" --title "${NAME}" --notes-file "${NOTES}" --latest
             fi
 
           elif [ "${ACTION}" = "edited" ]; then
             if [ "${EXISTS}" -eq 1 ]; then
               echo "Edit: syncing notes/title only, asset untouched."
-              gh release edit "${TAG}" --title "${NAME}" --notes-file release-notes.md
+              gh release edit "${TAG}" --title "${NAME}" --notes-file "${NOTES}"
             else
               echo "Edit but no GitHub release yet -> upsert (build + create)."
               OUTPUT="${GITHUB_WORKSPACE}/${MBP}"
               ( cd bot && zip -r "${OUTPUT}" csreg_scanner base-config.yaml maubot.yaml -x '*__pycache__*' -x '*.pyc' )
               ls -lh "${OUTPUT}"
-              gh release create "${TAG}" "${MBP}" --target "${SHA}" --title "${NAME}" --notes-file release-notes.md --latest
+              gh release create "${TAG}" "${MBP}" --target "${SHA}" --title "${NAME}" --notes-file "${NOTES}" --latest
             fi
           else
             echo "Unhandled action '${ACTION}' - nothing to do."
