@@ -23,15 +23,17 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import random
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, cast
 
 import aiohttp
-import yarl
 import dns.asyncresolver
+import yarl
 from dns.exception import DNSException
+from dns.rdtypes.IN.SRV import SRV
 
 DEFAULT_FEDERATION_PORT = 8448
 
@@ -64,7 +66,7 @@ def build_timeout(read_timeout: float) -> aiohttp.ClientTimeout:
     return aiohttp.ClientTimeout(sock_connect=_CONNECT_TIMEOUT, sock_read=read_timeout)
 
 
-async def read_json_capped(response: aiohttp.ClientResponse) -> Optional[Any]:
+async def read_json_capped(response: aiohttp.ClientResponse) -> Any | None:
     """Read a streaming response body up to _MAX_BODY_BYTES and JSON-parse it.
 
     Returns the parsed object, or None if the body overflows the cap or is not
@@ -116,10 +118,10 @@ class FederationTarget:
     host: str
     port: int
     host_header: str
-    tls_server_name: Optional[str]
+    tls_server_name: str | None
     resolution_method: ResolutionMethod
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "host": self.host,
             "port": self.port,
@@ -137,9 +139,9 @@ class ClientTarget:
     the caller decides whether to fall back to ``https://<server_name>``.
     """
 
-    base_url: Optional[str]
+    base_url: str | None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {"base_url": self.base_url}
 
 
@@ -149,7 +151,7 @@ class ServerResolution:
     federation: FederationTarget
     client: ClientTarget = field(default_factory=lambda: ClientTarget(None))
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "server_name": self.server_name,
             "federation": self.federation.to_dict(),
@@ -164,7 +166,7 @@ class ServerResolution:
 @dataclass
 class ParsedName:
     host: str                # hostname or IP literal (IPv6 WITHOUT brackets)
-    port: Optional[int]      # explicit port, or None
+    port: int | None      # explicit port, or None
     is_ip_literal: bool
     host_with_brackets: str  # host as written, IPv6 re-bracketed (for headers)
 
@@ -176,6 +178,7 @@ def parse_name(name: str) -> ParsedName:
     Raises ValueError on a malformed bracketed literal or non-numeric port.
     """
     name = name.strip()
+    port: int | None = None
 
     if name.startswith("["):
         close = name.index("]")  # ValueError if no closing bracket
@@ -187,7 +190,7 @@ def parse_name(name: str) -> ParsedName:
 
     if name.count(":") == 1:
         host, _, port_s = name.rpartition(":")
-        port: Optional[int] = int(port_s)
+        port = int(port_s)
     else:
         host, port = name, None
 
@@ -202,7 +205,7 @@ def _is_ip_literal(host: str) -> bool:
         return False
 
 
-def _host_header(host: str, port: Optional[int]) -> str:
+def _host_header(host: str, port: int | None) -> str:
     return f"{host}:{port}" if port is not None else host
 
 
@@ -221,10 +224,15 @@ class ServerResolver:
     def __init__(
         self,
         client: aiohttp.ClientSession,
-        dns_resolver: Optional[dns.asyncresolver.Resolver] = None,
+        dns_resolver: dns.asyncresolver.Resolver | None = None,
+        log: logging.Logger | None = None,
     ) -> None:
         self.client = client
         self.dns = dns_resolver or dns.asyncresolver.Resolver()
+        # Injected by the bot so resolver debug lines ride the instance logger
+        # (its level + the scan-target filter). Falls back to a module logger for
+        # standalone/CLI use, where it still surfaces under --debug.
+        self.log = log or logging.getLogger(__name__)
 
     async def resolve(self, server_name: str) -> FederationTarget:
         """The single preferred federation target (first candidate).
@@ -280,13 +288,26 @@ class ServerResolver:
         if m_server is not None:
             delegated = await self._resolve_delegated(m_server)
             if delegated:
+                self.log.debug(
+                    "resolve(%s): well-known delegates to m.server=%s "
+                    "(%d federation target(s))",
+                    server_name, m_server, len(delegated),
+                )
                 return delegated
             # A malformed m.server value falls through to SRV on the original
             # name, matching the "well-known error -> step 4" behaviour.
+            self.log.debug(
+                "resolve(%s): m.server=%s is unparseable; falling through to "
+                "SRV on the original name", server_name, m_server,
+            )
 
         # Step 4: SRV on the original hostname.
         srv = await self._srv_lookup(parsed.host)
         if srv:
+            self.log.debug(
+                "resolve(%s): SRV on original name -> %d target(s), first "
+                "%s:%d", server_name, len(srv), srv[0][0], srv[0][1],
+            )
             return [
                 FederationTarget(
                     host=target,
@@ -299,6 +320,10 @@ class ServerResolver:
             ]
 
         # Step 5: plain hostname on the default port.
+        self.log.debug(
+            "resolve(%s): no delegation or SRV; plain %s:%d",
+            server_name, parsed.host, DEFAULT_FEDERATION_PORT,
+        )
         return [FederationTarget(
             host=parsed.host,
             port=DEFAULT_FEDERATION_PORT,
@@ -362,7 +387,7 @@ class ServerResolver:
             resolution_method=ResolutionMethod.WELL_KNOWN_PLAIN,
         )]
 
-    async def _fetch_well_known_server(self, hostname: str) -> Optional[str]:
+    async def _fetch_well_known_server(self, hostname: str) -> str | None:
         """Fetch /.well-known/matrix/server, return ``m.server`` or None.
 
         Any failure (non-200, network error, oversize body, bad JSON,
@@ -378,14 +403,26 @@ class ServerResolver:
                 allow_redirects=True,
             ) as resp:
                 if resp.status != 200:
+                    self.log.debug(
+                        "well-known server(%s): HTTP %d -> no delegation",
+                        hostname, resp.status,
+                    )
                     return None
                 data = await read_json_capped(resp)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self.log.debug(
+                "well-known server(%s): fetch failed (%s) -> no delegation",
+                hostname, e,
+            )
             return None
         if not isinstance(data, dict):
             return None
         m_server = data.get("m.server")
         if not isinstance(m_server, str) or not m_server.strip():
+            self.log.debug(
+                "well-known server(%s): 200 but no usable m.server -> no "
+                "delegation", hostname,
+            )
             return None
         return m_server.strip()
 
@@ -415,7 +452,7 @@ class ServerResolver:
             # version-specific re-exports on dns.asyncresolver.
             return []
 
-        records = list(answers)
+        records = cast(list[SRV], list(answers))
         if not records:
             return []
 
@@ -432,7 +469,7 @@ class ServerResolver:
         return out
 
 
-def _order_srv(records: list) -> list:
+def _order_srv(records: list[SRV]) -> list[SRV]:
     """Order an SRV record set per RFC 2782: ascending priority, and within each
     priority band, repeated weighted selection WITHOUT replacement.
 
@@ -442,10 +479,10 @@ def _order_srv(records: list) -> list:
     at all. That is the property the fallback walk needs -- a weight-0 backup
     must still be reachable once the weighted primaries have been tried.
     """
-    by_priority: dict[int, list] = {}
+    by_priority: dict[int, list[SRV]] = {}
     for record in records:
         by_priority.setdefault(record.priority, []).append(record)
-    ordered: list = []
+    ordered: list[SRV] = []
     for priority in sorted(by_priority):
         band = list(by_priority[priority])
         while band:
@@ -455,7 +492,7 @@ def _order_srv(records: list) -> list:
     return ordered
 
 
-def _weighted_pick_index(records: list) -> int:
+def _weighted_pick_index(records: list[SRV]) -> int:
     """RFC 2782 weighted pick within one priority band; returns an index.
 
     ``pick < upto`` is strict on purpose. random.uniform(0, total) is INCLUSIVE
@@ -488,8 +525,11 @@ class ClientResolver:
     .well-known/matrix/client.
     """
 
-    def __init__(self, client: aiohttp.ClientSession) -> None:
+    def __init__(
+        self, client: aiohttp.ClientSession, log: logging.Logger | None = None
+    ) -> None:
         self.client = client
+        self.log = log or logging.getLogger(__name__)
 
     async def resolve(self, server_name: str) -> ClientTarget:
         """Return the client base URL, or ClientTarget(None) if none is published.
@@ -512,9 +552,17 @@ class ClientResolver:
                 allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
+                    self.log.debug(
+                        "client well-known(%s): HTTP %d -> no delegation",
+                        server_name, resp.status,
+                    )
                     return ClientTarget(None)
                 data = await read_json_capped(resp)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self.log.debug(
+                "client well-known(%s): fetch failed (%s) -> no delegation",
+                server_name, e,
+            )
             return ClientTarget(None)
 
         if not isinstance(data, dict):
@@ -547,7 +595,7 @@ class ClientResolver:
 async def resolve_all(
     server_name: str,
     client: aiohttp.ClientSession,
-    dns_resolver: Optional[dns.asyncresolver.Resolver] = None,
+    dns_resolver: dns.asyncresolver.Resolver | None = None,
 ) -> ServerResolution:
     fed = await ServerResolver(client, dns_resolver).resolve(server_name)
     cli = await ClientResolver(client).resolve(server_name)

@@ -18,8 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from csreg_scanner.resolver import parse_name, _order_srv, _weighted_pick_index
-
+from csreg_scanner.resolver import _order_srv, _weighted_pick_index, parse_name
 
 # --- parse_name -------------------------------------------------------------
 

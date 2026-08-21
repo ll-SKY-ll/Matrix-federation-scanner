@@ -8,6 +8,7 @@ from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 _LEAVES = [
     "policy_room",
     "auto_config_event_type",
+    "log_level",
     "scanner.timeout_seconds",
     "scanner.fetch_support",
     "scanner.ip_range_blacklist",
@@ -41,4 +42,3 @@ class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         for leaf in _LEAVES:
             helper.copy(leaf)
-            

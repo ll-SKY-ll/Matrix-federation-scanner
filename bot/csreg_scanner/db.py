@@ -85,7 +85,7 @@ class ScanRecord:
 _SQLITE_ENQUEUE_CHUNK = 500
 
 
-@upgrade_table.register(description="Initial schema: scan_queue + scanned (scan_target keyed)")
+@upgrade_table.register(description="Initial schema: scan_queue + scanned (scan_target keyed)")  # type: ignore[call-arg,arg-type]
 async def upgrade_v1(conn: Connection) -> None:
     # scan_queue: one row per pending scan target. `leased_until` is a soft lease
     # (epoch seconds) claimed when a tick launches the scan, so overlapping ticks
@@ -124,7 +124,7 @@ async def upgrade_v1(conn: Connection) -> None:
     await conn.execute("CREATE INDEX scanned_domain_idx ON scanned (domain)")
 
 
-@upgrade_table.register(
+@upgrade_table.register(  # type: ignore[call-arg,arg-type]
     description="Drop unused scanned_last_scan_idx; enable HOT updates on scanned (PG)"
 )
 async def upgrade_v2(conn: Connection) -> None:
@@ -158,7 +158,7 @@ async def upgrade_v2(conn: Connection) -> None:
         await conn.execute("ALTER TABLE scanned SET (fillfactor = 90)")
 
 
-@upgrade_table.register(
+@upgrade_table.register(  # type: ignore[call-arg,arg-type]
     description="Add federation version columns (fed_name, fed_version, fed_version_at)"
 )
 async def upgrade_v3(conn: Connection) -> None:
@@ -180,7 +180,7 @@ async def upgrade_v3(conn: Connection) -> None:
     await conn.execute("ALTER TABLE scanned ADD COLUMN fed_version_at BIGINT")
 
 
-@upgrade_table.register(
+@upgrade_table.register(  # type: ignore[call-arg,arg-type]
     description="Add support_info table (/.well-known/matrix/support documents)"
 )
 async def upgrade_v4(conn: Connection) -> None:
@@ -215,7 +215,7 @@ async def upgrade_v4(conn: Connection) -> None:
     )
 
 
-@upgrade_table.register(
+@upgrade_table.register(  # type: ignore[call-arg,arg-type]
     description="Add psl_cache table (last fetched public suffix list)"
 )
 async def upgrade_v5(conn: Connection) -> None:
@@ -306,12 +306,12 @@ class DB:
         # dict.fromkeys preserves order (deterministic logs/tests) while unique.
         unique = list(dict.fromkeys(targets))
 
-        async with self._db.acquire() as conn:
-            async with conn.transaction():
-                if self._db.scheme == Scheme.SQLITE:
-                    await self._enqueue_sqlite(conn, unique)
-                else:
-                    await self._enqueue_unnest(conn, unique)
+        conn: Connection
+        async with self._db.acquire() as conn, conn.transaction():
+            if self._db.scheme == Scheme.SQLITE:
+                await self._enqueue_sqlite(conn, unique)
+            else:
+                await self._enqueue_unnest(conn, unique)
 
     async def _enqueue_unnest(self, conn: Connection, targets: list[str]) -> None:
         """Postgres/Cockroach path: one set-based INSERT for the whole batch.
@@ -381,41 +381,41 @@ class DB:
         """
         ts = now()
         claimed: list[str] = []
-        async with self._db.acquire() as conn:
-            async with conn.transaction():
-                rows = await conn.fetch(
-                    """
+        conn: Connection
+        async with self._db.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                """
                     SELECT scan_target FROM scan_queue
                     WHERE leased_until IS NULL OR leased_until < $1
                     ORDER BY scan_target
                     LIMIT $2
                     """,
-                    ts,
-                    limit,
-                )
-                claimed = [r["scan_target"] for r in rows]
-                if claimed:
-                    lease = ts + int(lease_seconds)
-                    if self._db.scheme == Scheme.SQLITE:
-                        # No array type; one statement per row, as before.
-                        for target in claimed:
-                            await conn.execute(
-                                "UPDATE scan_queue SET leased_until = $1 "
-                                "WHERE scan_target = $2",
-                                lease,
-                                target,
-                            )
-                    else:
-                        # Postgres/Cockroach: one statement for the whole claim.
-                        # At rescan.batch_limit-sized batches this replaces up to
-                        # a couple hundred round-trips per tick with a single
-                        # planned UPDATE over an array-driven PK lookup.
+                ts,
+                limit,
+            )
+            claimed = [r["scan_target"] for r in rows]
+            if claimed:
+                lease = ts + int(lease_seconds)
+                if self._db.scheme == Scheme.SQLITE:
+                    # No array type; one statement per row, as before.
+                    for target in claimed:
                         await conn.execute(
                             "UPDATE scan_queue SET leased_until = $1 "
-                            "WHERE scan_target = ANY($2::text[])",
+                            "WHERE scan_target = $2",
                             lease,
-                            claimed,
+                            target,
                         )
+                else:
+                    # Postgres/Cockroach: one statement for the whole claim.
+                    # At rescan.batch_limit-sized batches this replaces up to
+                    # a couple hundred round-trips per tick with a single
+                    # planned UPDATE over an array-driven PK lookup.
+                    await conn.execute(
+                        "UPDATE scan_queue SET leased_until = $1 "
+                        "WHERE scan_target = ANY($2::text[])",
+                        lease,
+                        claimed,
+                    )
         return claimed
 
     async def queue_depth(self) -> int:
@@ -444,16 +444,16 @@ class DB:
         # against KNOWN_STATUSES, but guard here too: refuse anything outside a
         # safe charset so this method can never build injectable SQL regardless
         # of how it is called.
-        for status in staleness:
+        for status, t in staleness.items():
             if not status or not status.replace("_", "").isalnum():
                 raise ValueError(f"unsafe status key in staleness map: {status!r}")
-            if int(staleness[status]) <= 0:
+            if int(t) <= 0:
                 # A non-positive T is a divide-by-zero (Postgres raises; SQLite
                 # silently yields NULL and destroys the ordering). The bot's
                 # sanitizer drops these at startup; refuse here too so no caller
                 # can hand us one.
                 raise ValueError(
-                    f"staleness for {status!r} must be > 0, got {staleness[status]!r}"
+                    f"staleness for {status!r} must be > 0, got {t!r}"
                 )
         if staleness:
             cases = "\n".join(
@@ -537,111 +537,108 @@ class DB:
         """
         ts = now()
         domain = strip_port(scan_target)
-        async with self._db.acquire() as conn:
-            async with conn.transaction():
-                existing = await conn.fetchrow(
-                    "SELECT reg_status, error_streak, status_since, "
-                    "fed_name, fed_version "
-                    "FROM scanned WHERE scan_target = $1",
-                    scan_target,
-                )
-                if ok:
-                    new_status = status or "unknown"
-                    last_success = ts
-                    streak = 0
-                else:
-                    # Keep the last known status on failure; only refresh the
-                    # attempt clock and bump the failure signal. A first-ever
-                    # scan that fails lands as "unknown" (no prior status to
-                    # keep). Crucially we do NOT reset a known status to unknown
-                    # on a transient failure -- that could flip a ban-mapped row
-                    # to unban-eligible.
-                    new_status = existing["reg_status"] if existing else "unknown"
-                    last_success = None  # COALESCE preserves any prior success
-                    streak = (existing["error_streak"] + 1) if existing else 1
+        conn: Connection
+        async with self._db.acquire() as conn, conn.transaction():
+            existing = await conn.fetchrow(
+                "SELECT reg_status, error_streak, status_since, "
+                "fed_name, fed_version "
+                "FROM scanned WHERE scan_target = $1",
+                scan_target,
+            )
+            if ok:
+                new_status = status or "unknown"
+                last_success = ts
+                streak = 0
+            else:
+                # Keep the last known status on failure; only refresh the
+                # attempt clock and bump the failure signal. A first-ever
+                # scan that fails lands as "unknown" (no prior status to
+                # keep). Crucially we do NOT reset a known status to unknown
+                # on a transient failure -- that could flip a ban-mapped row
+                # to unban-eligible.
+                new_status = existing["reg_status"] if existing else "unknown"
+                last_success = None  # COALESCE preserves any prior success
+                streak = (existing["error_streak"] + 1) if existing else 1
 
-                # Change signal + status_since both come from this one comparison.
-                # First-ever insert: a transition from "nothing known" -> counts
-                # as changed, previous_status None. On a real status move: changed,
-                # previous_status is the old value. Unchanged: preserve status_since.
-                prev_status = existing["reg_status"] if existing else None
-                if existing is None:
-                    changed = True
-                    status_since = ts
-                elif new_status != existing["reg_status"]:
-                    changed = True
-                    status_since = ts
-                else:
-                    changed = False
-                    status_since = existing["status_since"] or ts
+            # Change signal + status_since both come from this one comparison.
+            # First-ever insert: a transition from "nothing known" -> counts
+            # as changed, previous_status None. On a real status move: changed,
+            # previous_status is the old value. Unchanged: preserve status_since.
+            prev_status = existing["reg_status"] if existing else None
+            if existing is None or new_status != existing["reg_status"]:
+                changed = True
+                status_since = ts
+            else:
+                changed = False
+                status_since = existing["status_since"] or ts
 
-                # Federation version change signal, computed independently of the
-                # reg_status change. Only an AUTHORITATIVE probe can register a
-                # change (a non-authoritative probe preserves the stored pair, so
-                # comparing new-vs-stored would be a no-op anyway). A fall-to-null
-                # -- an authoritative null-report that clears a previously-known
-                # version (X -> -) -- is deliberately NOT counted, mirroring the
-                # reg-status rule that a preserved/absent value isn't a change.
-                prev_name = existing["fed_name"] if existing else None
-                prev_version = existing["fed_version"] if existing else None
-                prev_ver_pair = (prev_name, prev_version) if existing else None
-                new_ver_pair = (fed_name, fed_version)
-                version_changed = (
-                    fed_observed
-                    and new_ver_pair != (prev_name, prev_version)
-                    and not (fed_name is None and fed_version is None)
-                )
+            # Federation version change signal, computed independently of the
+            # reg_status change. Only an AUTHORITATIVE probe can register a
+            # change (a non-authoritative probe preserves the stored pair, so
+            # comparing new-vs-stored would be a no-op anyway). A fall-to-null
+            # -- an authoritative null-report that clears a previously-known
+            # version (X -> -) -- is deliberately NOT counted, mirroring the
+            # reg-status rule that a preserved/absent value isn't a change.
+            prev_name = existing["fed_name"] if existing else None
+            prev_version = existing["fed_version"] if existing else None
+            prev_ver_pair = (prev_name, prev_version) if existing else None
+            new_ver_pair = (fed_name, fed_version)
+            version_changed = (
+                fed_observed
+                and new_ver_pair != (prev_name, prev_version)
+                and not (fed_name is None and fed_version is None)
+            )
 
-                # Federation version values to feed the INSERT branch. On a
-                # brand-new row there is nothing to preserve, so a non-authoritative
-                # probe simply inserts NULLs; an authoritative probe inserts the
-                # reported values (which may themselves be null). fed_version_at is
-                # set only when authoritative. The UPDATE branch (below) re-derives
-                # overwrite-vs-preserve from the $8 flag via CASE.
-                ins_name = fed_name if fed_observed else None
-                ins_version = fed_version if fed_observed else None
-                ins_version_at = ts if fed_observed else None
+            # Federation version values to feed the INSERT branch. On a
+            # brand-new row there is nothing to preserve, so a non-authoritative
+            # probe simply inserts NULLs; an authoritative probe inserts the
+            # reported values (which may themselves be null). fed_version_at is
+            # set only when authoritative. The UPDATE branch (below) re-derives
+            # overwrite-vs-preserve from the $8 flag via CASE.
+            ins_name = fed_name if fed_observed else None
+            ins_version = fed_version if fed_observed else None
+            ins_version_at = ts if fed_observed else None
 
-                await conn.execute(
-                    """
-                    INSERT INTO scanned
-                        (scan_target, domain, discovered_at, last_scan_at,
-                         last_success_at, reg_status, scan_count, error_streak,
-                         status_since, fed_name, fed_version, fed_version_at)
-                    VALUES ($1, $2, $3, $3, $4, $5, 1, $6, $7, $9, $10, $11)
-                    ON CONFLICT (scan_target) DO UPDATE SET
-                        last_scan_at    = excluded.last_scan_at,
-                        last_success_at = COALESCE(excluded.last_success_at,
-                                                   scanned.last_success_at),
-                        reg_status      = excluded.reg_status,
-                        scan_count      = scanned.scan_count + 1,
-                        error_streak    = excluded.error_streak,
-                        status_since    = excluded.status_since,
-                        fed_name        = CASE WHEN $8
-                                               THEN excluded.fed_name
-                                               ELSE scanned.fed_name END,
-                        fed_version     = CASE WHEN $8
-                                               THEN excluded.fed_version
-                                               ELSE scanned.fed_version END,
-                        fed_version_at  = CASE WHEN $8
-                                               THEN excluded.fed_version_at
-                                               ELSE scanned.fed_version_at END
-                    """,
-                    scan_target,
-                    domain,
-                    ts,
-                    last_success,
-                    new_status,
-                    streak,
-                    status_since,
-                    fed_observed,
-                    ins_name,
-                    ins_version,
-                    ins_version_at,
-                )
-                await conn.execute(
-                    "DELETE FROM scan_queue WHERE scan_target = $1", scan_target
-                )
+            await conn.execute(
+                """
+                INSERT INTO scanned
+                    (scan_target, domain, discovered_at, last_scan_at,
+                     last_success_at, reg_status, scan_count, error_streak,
+                     status_since, fed_name, fed_version, fed_version_at)
+                VALUES ($1, $2, $3, $3, $4, $5, 1, $6, $7, $9, $10, $11)
+                ON CONFLICT (scan_target) DO UPDATE SET
+                    last_scan_at    = excluded.last_scan_at,
+                    last_success_at = COALESCE(excluded.last_success_at,
+                                               scanned.last_success_at),
+                    reg_status      = excluded.reg_status,
+                    scan_count      = scanned.scan_count + 1,
+                    error_streak    = excluded.error_streak,
+                    status_since    = excluded.status_since,
+                    fed_name        = CASE WHEN $8
+                                           THEN excluded.fed_name
+                                           ELSE scanned.fed_name END,
+                    fed_version     = CASE WHEN $8
+                                           THEN excluded.fed_version
+                                           ELSE scanned.fed_version END,
+                    fed_version_at  = CASE WHEN $8
+                                           THEN excluded.fed_version_at
+                                           ELSE scanned.fed_version_at END
+                """,
+                scan_target,
+                domain,
+                ts,
+                last_success,
+                new_status,
+                streak,
+                status_since,
+                fed_observed,
+                ins_name,
+                ins_version,
+                ins_version_at,
+            )
+            await conn.execute(
+                "DELETE FROM scan_queue WHERE scan_target = $1", scan_target
+            )
         return ScanRecord(
             changed=changed,
             previous_status=prev_status,
@@ -846,6 +843,7 @@ class DB:
             FROM support_info
             """
         )
+        assert row is not None, "no-GROUP-BY aggregate always returns one row"
         return int(row["total"]), int(row["reachable"])
 
     async def scan_totals(self) -> tuple[int, int, int]:
@@ -874,6 +872,7 @@ class DB:
             "SELECT COUNT(*) AS targets, COALESCE(SUM(scan_count), 0) AS scans "
             "FROM scanned"
         )
+        assert row is not None, "no-GROUP-BY aggregate always returns one row"
         targets = int(row["targets"])
         scans = int(row["scans"])
         return targets, max(scans - targets, 0), scans

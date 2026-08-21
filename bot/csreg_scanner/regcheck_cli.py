@@ -39,9 +39,10 @@ import asyncio
 import json
 import logging
 import sys
-from typing import Optional
+from typing import TYPE_CHECKING, Any
 
-import aiohttp
+if TYPE_CHECKING:
+    from .regcheck import RegistrationChecker
 
 # Import the real modules WITHOUT triggering the package __init__.
 #
@@ -59,8 +60,10 @@ import importlib.util
 import os
 import types
 
+import aiohttp
 
-def _load_sibling_modules():
+
+def _load_sibling_modules() -> tuple[types.ModuleType, types.ModuleType, types.ModuleType, types.ModuleType]:
     here = os.path.dirname(os.path.abspath(__file__))
     pkg_name = os.path.basename(here) or "csreg_scanner"
 
@@ -72,7 +75,7 @@ def _load_sibling_modules():
         pkg.__path__ = [here]  # marks it as a package
         sys.modules[pkg_name] = pkg
 
-    def _load(mod_basename: str):
+    def _load(mod_basename: str) -> types.ModuleType:
         full_name = f"{pkg_name}.{mod_basename}"
         if full_name in sys.modules:
             return sys.modules[full_name]
@@ -93,7 +96,6 @@ def _load_sibling_modules():
 
 
 _regcheck, _resolver, _fedversion, _supportinfo = _load_sibling_modules()
-RegistrationChecker = _regcheck.RegistrationChecker
 UNKNOWN = _regcheck.UNKNOWN
 ServerResolver = _resolver.ServerResolver
 ClientResolver = _resolver.ClientResolver
@@ -139,10 +141,10 @@ def _build_client() -> aiohttp.ClientSession:
 
 
 async def _capture_register_flows(
-    checker: "RegistrationChecker",
+    checker: RegistrationChecker,
     target: str,
     client: aiohttp.ClientSession,
-) -> dict:
+) -> dict[str, Any]:
     """Re-probe POST /_matrix/client/v3/register purely to surface the RAW UIA
     body for display -- the classifier consumes this internally and returns only
     a verdict, so the CLI repeats the probe to show what the server actually
@@ -152,7 +154,7 @@ async def _capture_register_flows(
     Returns a dict for display: {"base_url", "status", and either "flows" (the
     list of per-flow stage lists) or "note"/"error"}. Never raises.
     """
-    info: dict = {}
+    info: dict[str, Any] = {}
     try:
         base_url, _wk = await checker._base_url(target)
     except Exception as e:  # noqa: BLE001
@@ -201,15 +203,15 @@ async def check_one(
     log: logging.Logger,
     timeout: float,
     verbose: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Classify one target and (optionally) gather diagnostic detail for display.
 
     Returns a dict: {"target", "status", and when verbose: "client_base_url",
     "federation", "register" (raw UIA flows), "fed_version", "support"}.
     """
-    out: dict = {"target": target}
+    out: dict[str, Any] = {"target": target}
 
-    checker = RegistrationChecker(client, log)
+    checker = _regcheck.RegistrationChecker(client, log)
     try:
         status = await asyncio.wait_for(checker.classify(target), timeout=timeout)
     except asyncio.TimeoutError:
@@ -329,7 +331,7 @@ def _support_fmt_value(value: object) -> str:
 
 
 def _render_support_lines(
-    doc: dict, max_contacts: Optional[int] = None
+    doc: dict[str, Any], max_contacts: int | None = None
 ) -> list[str]:
     """Render a parsed support document as labelled key=value display lines.
 
@@ -415,7 +417,7 @@ def _fmt_status(status: str, use_color: bool) -> str:
     return status
 
 
-def _print_human(result: dict, use_color: bool) -> None:
+def _print_human(result: dict[str, Any], use_color: bool) -> None:
     target = result["target"]
     status = result["status"]
     print(f"{target:<40} {_fmt_status(status, use_color)}")
@@ -491,7 +493,7 @@ def _print_human(result: dict, use_color: bool) -> None:
                     print(f"        {ln}")
 
 
-async def _amain(argv: Optional[list[str]] = None) -> int:
+async def _amain(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="regcheck_cli.py",
         description=(
@@ -552,7 +554,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
 
     use_color = (not args.no_color) and sys.stdout.isatty()
 
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     async with _build_client() as client:
         # Sequential: this is a spot-check tool, not the bulk scanner. The bot
         # owns concurrency in production; here we keep output readable and

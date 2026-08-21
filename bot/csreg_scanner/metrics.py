@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiohttp import web
 
 from .taxonomy import STATUS_METRIC_VALUE, metric_help_mapping
 
 # A snapshot the bot hands the server on each scrape.
-MetricsSnapshot = dict
+MetricsSnapshot = dict[str, Any]
 
 
 def _esc_label(v: str) -> str:
@@ -346,7 +347,7 @@ class MetricsServer:
         return "\n".join(out) + "\n"
 
 
-def _gauge(out: list[str], name: str, help_text: str, value) -> None:
+def _gauge(out: list[str], name: str, help_text: str, value: float) -> None:
     out.append(f"# HELP {name} {help_text}")
     out.append(f"# TYPE {name} gauge")
     out.append(f"{name} {value}")

@@ -18,8 +18,9 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from mautrix.client import Client
 from mautrix.errors import MatrixRequestError, MLimitExceeded, MNotFound
@@ -27,6 +28,8 @@ from mautrix.types import EventType, RoomID, StateEvent
 
 from .psl import PSLHolder, PublicSuffixList, parse_psl_version
 from .util import is_ip_literal, now, strip_port, validate_server_name
+
+_LOG = logging.getLogger(__name__)
 
 ACTIONS = frozenset({"ban", "unban", "hold"})
 POLICY_RULE_SERVER = EventType.find(
@@ -227,10 +230,10 @@ class PolicyManager:
         max_writes_per_second: float,
         known_statuses: frozenset[str],
         log: logging.Logger,
-        domain_statuses: "DomainStatusProvider",
+        domain_statuses: DomainStatusProvider,
         own_version: str | None = None,
         psl_holder: PSLHolder | None = None,
-        on_psl_floor_halt: "Callable[[], None] | None" = None,
+        on_psl_floor_halt: Callable[[], None] | None = None,
         psl_auto_update: bool = True,
     ) -> None:
         self.client = client
@@ -444,7 +447,7 @@ class PolicyManager:
             if self._on_psl_floor_halt is not None:
                 try:
                     self._on_psl_floor_halt()
-                except Exception:  # noqa: BLE001 -- a notifier must never break policy
+                except Exception:  # a notifier must never break policy
                     self.log.debug("psl floor halt notifier failed", exc_info=True)
         else:
             self.log.info(
@@ -489,7 +492,7 @@ class PolicyManager:
             self._halt(f"auto_config unreadable: {type(e).__name__}: {e}")
             return False
 
-        data = _as_dict(content)
+        data = _as_dict(content, self.log)
         self._apply_auto_config(data)
         return True
 
@@ -498,7 +501,7 @@ class PolicyManager:
         Called from the bot's state-event handler the moment the operator edits
         the event, so governance changes propagate without a redeploy and
         without per-tick polling."""
-        self._apply_auto_config(_as_dict(content))
+        self._apply_auto_config(_as_dict(content, self.log))
 
     @staticmethod
     def _field(data: dict[str, Any], name: str, version: int, default: Any = None) -> Any:
@@ -885,10 +888,10 @@ class PolicyManager:
         rules: dict[str, dict[str, Any]] = {}
         for evt in state:
             if not isinstance(evt, StateEvent):
-                continue
+                continue  # type: ignore[unreachable]
             if str(evt.type) != "m.policy.rule.server":
                 continue
-            rules[evt.state_key] = _as_dict(evt.content)
+            rules[evt.state_key] = _as_dict(evt.content, self.log)
         self._rules = rules
         self._rules_loaded = True
         return True
@@ -940,7 +943,7 @@ class PolicyManager:
         other operators' bots, the self-service bot, manual ops. Called
         from the bot's m.policy.rule.server state-event handler. Empty content
         means the rule was removed (tombstone)."""
-        self._rules[state_key] = _as_dict(content)
+        self._rules[state_key] = _as_dict(content, self.log)
 
     # --- writes ----------------------------------------------------------------
 
@@ -1342,7 +1345,8 @@ def _retry_after_seconds(exc: MLimitExceeded, attempt: int) -> float:
     return min(delay, _RL_MAX_BACKOFF)
 
 
-def _as_dict(obj: Any) -> dict[str, Any]:
+def _as_dict(obj: Any, log: logging.Logger | None = None) -> dict[str, Any]:
+    _log = log or _LOG
     if isinstance(obj, dict):
         return dict(obj)
     if hasattr(obj, "serialize"):
@@ -1351,9 +1355,10 @@ def _as_dict(obj: Any) -> dict[str, Any]:
             if isinstance(ser, dict):
                 return ser
         except Exception:  # noqa: BLE001
-            pass
+            _log.debug("_as_dict: serialize() failed on %r, trying dict()", type(obj))
     try:
         return dict(obj)
     except Exception:  # noqa: BLE001
+        _log.warning("_as_dict: could not coerce %r to dict, returning empty", type(obj))
         return {}
     

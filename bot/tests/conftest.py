@@ -95,17 +95,38 @@ async def database(db_backend, tmp_path):
 
     # postgres: wipe to a clean public schema before applying migrations, so
     # leftover state from an interrupted run cannot bleed across tests.
-    db = Database.create(_PG_DSN, upgrade_table=upgrade_table)
-    # Reset schema on the raw connection BEFORE start() runs the upgrade table,
-    # otherwise the UpgradeTable sees existing version metadata and no-ops.
+    #
+    # Ordering matters: reset the schema on a side connection BEFORE the Database
+    # is created, so no pool connection exists during the DROP SCHEMA. mautrix
+    # pins the pool to the event loop live at start() time, and pytest-asyncio
+    # uses a fresh per-test loop; resetting before any pool exists keeps the
+    # DROP/CREATE from racing a connection whose teardown the loop may not have
+    # finished. DROP and CREATE are issued as SEPARATE simple-query executes (not
+    # one semicolon-joined string) so each autocommits cleanly.
+    #
+    # NOTE: this assumes only ONE process touches this database at a time. The CI
+    # workflow enforces that by running the Python versions sequentially in a
+    # single job (Forgejo runner 13.0.0 ignores strategy.max-parallel, so a
+    # matrix would run them concurrently and their resets would collide). If that
+    # invariant ever changes, isolate per worker (unique schema or database)
+    # rather than resetting a shared `public`.
     import asyncpg
 
     reset = await asyncpg.connect(_PG_DSN)
     try:
-        await reset.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await reset.execute("DROP SCHEMA public CASCADE")
+        await reset.execute("CREATE SCHEMA public")
     finally:
         await reset.close()
 
+    # Pool pinned to a SINGLE connection (min=max=1): with a fresh Database per
+    # test and a clean schema, there is exactly one backend and no stale sibling
+    # caching plans against a dropped schema.
+    db = Database.create(
+        _PG_DSN,
+        upgrade_table=upgrade_table,
+        db_args={"min_size": 1, "max_size": 1},
+    )
     await db.start()
     try:
         yield db
@@ -129,8 +150,6 @@ async def database(db_backend, tmp_path):
 # so the same fakes back the reconcile, cleanup, and PSL-floor tests uniformly.
 
 import logging as _logging
-
-from mautrix.errors import MLimitExceeded
 
 
 class FakeClient:
@@ -220,18 +239,18 @@ def make_policy(**overrides):
         async def ds(domain):
             return []
 
-    kwargs = dict(
-        client=client,
-        room_id="!room:example.org",
-        auto_config_type="com.example.csreg.autoconfig",
-        max_writes_per_second=0,        # 0 disables the throttle in tests
-        known_statuses=frozenset(
+    kwargs = {
+        "client": client,
+        "room_id": "!room:example.org",
+        "auto_config_type": "com.example.csreg.autoconfig",
+        "max_writes_per_second": 0,        # 0 disables the throttle in tests
+        "known_statuses": frozenset(
             {"dangerously_open", "open", "oauth", "closed", "unknown"}
         ),
-        log=_logging.getLogger("test_policy"),
-        domain_statuses=ds,
-        own_version="0.2.0",
-    )
+        "log": _logging.getLogger("test_policy"),
+        "domain_statuses": ds,
+        "own_version": "0.2.0",
+    }
     kwargs.update(overrides)
     return PolicyManager(**kwargs), client
 

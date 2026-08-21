@@ -38,7 +38,6 @@ import pytest
 # __init__, which pulls the plugin stack -- that's expected and matches CI.
 from csreg_scanner import ipfilter
 
-
 # A throwaway logger for the units that warn. We don't assert on log output in
 # most tests; where we do (parse_networks warnings) we use caplog.
 _LOG = logging.getLogger("test_ipfilter")

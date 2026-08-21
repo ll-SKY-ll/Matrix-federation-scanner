@@ -33,7 +33,6 @@ import pytest_asyncio
 
 from csreg_scanner import sources
 
-
 _LOG = logging.getLogger("test_sources")
 
 

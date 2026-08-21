@@ -31,12 +31,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
+from conftest import FakeClient, FakeHolder, FakePSL, make_policy
 
-from conftest import FakeClient, FakePSL, FakeHolder, make_policy
 from csreg_scanner import policy as pol
-from csreg_scanner.policy import parse_bot_version, key_active
-
+from csreg_scanner.policy import key_active, parse_bot_version
 
 DANGEROUS = "dangerously_open"
 CLOSED = "closed"
@@ -657,7 +655,7 @@ def _cleanup_ready(pm, client):
 
 async def test_cleanup_disabled_when_not_named():
     """Cleanup is inert unless this bot is in cleanup_bot_ids."""
-    pm, client = make_policy()
+    pm, _client = make_policy()
     pm._apply_auto_config(_v2(stale_max_age=100, cleanup_bot_ids=["@other:x.org"]))
     pm._rules_loaded = True
     assert pm.cleanup_enabled is False

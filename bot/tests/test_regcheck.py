@@ -36,20 +36,18 @@ from __future__ import annotations
 
 import logging
 
-import pytest
+from conftest import FakeResponse, FakeSession
 
-from conftest import FakeSession, FakeResponse
 from csreg_scanner.regcheck import (
-    RegistrationChecker,
-    classify_register_body,
-    _flow_classification,
-    DANGEROUSLY_OPEN,
-    OPEN,
-    OAUTH,
     CLOSED,
+    DANGEROUSLY_OPEN,
+    OAUTH,
+    OPEN,
     UNKNOWN,
+    RegistrationChecker,
+    _flow_classification,
+    classify_register_body,
 )
-
 
 _LOG = logging.getLogger("test_regcheck")
 

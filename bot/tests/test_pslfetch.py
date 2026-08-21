@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import pytest
 
-from csreg_scanner.psl import validate_psl_text, PSLValidationError
+from csreg_scanner.psl import PSLValidationError, validate_psl_text
 from csreg_scanner.pslfetch import jittered_interval
-
 
 _MARKERS = (
     "// ===BEGIN ICANN DOMAINS===\n"

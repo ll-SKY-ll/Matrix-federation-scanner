@@ -10,3 +10,5 @@ asyncpg          # postgres backend for the DB tests (skipped without a DSN)
 aiosqlite        # sqlite backend for the DB tests (always runs)
 pytest
 pytest-asyncio
+ruff
+mypy

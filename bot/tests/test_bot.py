@@ -24,11 +24,10 @@ from __future__ import annotations
 import logging
 
 from csreg_scanner.bot import (
-    CSRegScanner,
     _DEFAULT_STALENESS_SECONDS,
+    CSRegScanner,
     _sanitize_staleness,
 )
-
 
 _LOG = logging.getLogger("test_bot")
 

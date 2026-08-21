@@ -34,7 +34,6 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import aiohttp
 
@@ -60,10 +59,10 @@ class SupportInfo:
     """
 
     authoritative: bool
-    raw_json: Optional[str] = None
+    raw_json: str | None = None
 
     @classmethod
-    def no_signal(cls) -> "SupportInfo":
+    def no_signal(cls) -> SupportInfo:
         """A non-authoritative result: the caller preserves prior stored data."""
         return cls(False, None)
 
@@ -94,6 +93,9 @@ class SupportInfoProbe:
         try:
             parsed = parse_name(scan_target)
         except ValueError:
+            self.log.debug(
+                "support fetch(%s): unparseable server name", scan_target
+            )
             return SupportInfo.no_signal()
 
         # host_with_brackets re-brackets IPv6 literals so the URL stays valid;
@@ -106,6 +108,10 @@ class SupportInfoProbe:
                 allow_redirects=True,
             ) as resp:
                 if resp.status != 200:
+                    self.log.debug(
+                        "support fetch(%s): HTTP %d -> no support signal",
+                        scan_target, resp.status,
+                    )
                     return SupportInfo.no_signal()
                 data = await read_json_capped(resp)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -117,8 +123,15 @@ class SupportInfoProbe:
         # not a plausible support document, and storing it would let a 200-with-
         # junk overwrite a previously good record.
         if not isinstance(data, dict):
+            self.log.debug(
+                "support fetch(%s): 200 but body is not a JSON object -> no "
+                "signal", scan_target,
+            )
             return SupportInfo.no_signal()
 
+        self.log.debug(
+            "support fetch(%s): stored support document", scan_target
+        )
         return SupportInfo(
             True, json.dumps(data, separators=(",", ":"), sort_keys=True)
         )

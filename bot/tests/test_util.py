@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from csreg_scanner.util import is_ip_literal, strip_port, validate_server_name
 
-
 # --- is_ip_literal: the two documented past fail-opens --------------------
 
 

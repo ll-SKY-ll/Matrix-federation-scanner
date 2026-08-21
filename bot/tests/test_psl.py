@@ -19,11 +19,10 @@ from datetime import datetime, timezone
 import pytest
 
 from csreg_scanner.psl import (
-    PublicSuffixList,
     PSLHolder,
+    PublicSuffixList,
     parse_psl_version,
 )
-
 
 # A small hand-built list exercising all rule kinds. VERSION header present so
 # it is orderable / adoptable.

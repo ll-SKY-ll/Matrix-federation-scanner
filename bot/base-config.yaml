@@ -6,6 +6,10 @@ policy_room: "!CHANGEME:codestorm.net"
 # Auto_config state event type. This event will control which servers this bot bans
 auto_config_event_type: "net.codestorm.csreg.auto_config"
 
+# Explicit log verbosity to overwrite whatever is set on the maubot instance config
+# One of: DEBUG, INFO, WARNING, ERROR. DEBUG adds a per-scan trail.
+log_level: INFO
+
 # ── Scanner (in-process registration checker) ───────────────────────────────
 scanner:
   # Total per-target scan budget. Classification runs first under this budget;

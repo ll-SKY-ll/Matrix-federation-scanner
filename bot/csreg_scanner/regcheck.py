@@ -35,11 +35,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
 import yarl
 
+from .fedversion import FederationVersion, FederationVersionProbe
 from .ipfilter import IPRangePolicy, build_connector
 from .resolver import (
     ClientResolver,
@@ -47,9 +48,7 @@ from .resolver import (
     parse_name,
     read_json_capped,
 )
-from .fedversion import FederationVersion, FederationVersionProbe
 from .supportinfo import SupportInfo, SupportInfoProbe
-
 
 # --- status constants (must exist in taxonomy.KNOWN_STATUSES) ---------------- #
 
@@ -97,11 +96,11 @@ class ScanResult:
     """
 
     ok: bool
-    status: Optional[str]
-    error: Optional[str] = None
+    status: str | None
+    error: str | None = None
 
 
-def _flow_classification(stages: object) -> Optional[str]:
+def _flow_classification(stages: object) -> str | None:
     """Classify a single flow's ``stages`` list into a precedence label.
 
     Returns:
@@ -129,7 +128,7 @@ def _flow_classification(stages: object) -> Optional[str]:
     return OPEN  # at least one unrecognised stage -> treat as open, not dangerous
 
 
-def classify_register_body(body: object) -> Optional[str]:
+def classify_register_body(body: object) -> str | None:
     """Interpret a 401 UIA registration body. Returns dangerously_open / open,
     or None if the body has no usable flows (caller treats None as no-signal).
 
@@ -145,7 +144,7 @@ def classify_register_body(body: object) -> Optional[str]:
         return None
 
     saw_valid_flow = False
-    result: Optional[str] = None
+    result: str | None = None
     for flow in flows:
         if not isinstance(flow, dict):
             continue
@@ -178,7 +177,7 @@ class RegistrationChecker:
     def __init__(self, client: aiohttp.ClientSession, log: logging.Logger) -> None:
         self.client = client
         self.log = log
-        self._client_resolver = ClientResolver(client)
+        self._client_resolver = ClientResolver(client, log)
 
     async def classify(self, scan_target: str) -> str:
         """Return one of the status constants. Never raises; indeterminate
@@ -190,21 +189,48 @@ class RegistrationChecker:
         try:
             base_url, well_known = await self._base_url(scan_target)
             if base_url is None:
+                self.log.debug(
+                    "classify(%s): server name did not resolve to a base URL "
+                    "-> unknown", scan_target,
+                )
                 return UNKNOWN
+            self.log.debug(
+                "classify(%s): base_url=%s client_well_known=%s",
+                scan_target, base_url,
+                "present" if well_known is not None else "absent",
+            )
 
             # Gather both signals before deciding -- do NOT short-circuit on
             # oauth, because a live unguarded legacy flow must be able to
             # override an oauth announcement.
-            legacy = await self._probe_register(base_url)
+            legacy = await self._probe_register(base_url, scan_target=scan_target)
             if legacy == DANGEROUSLY_OPEN:
+                self.log.debug(
+                    "classify(%s): unguarded legacy registration flow "
+                    "-> dangerously_open", scan_target,
+                )
                 return DANGEROUSLY_OPEN  # highest precedence, wins outright
 
-            if await self._is_oauth_delegated(base_url, well_known):
+            if await self._is_oauth_delegated(
+                base_url, well_known, scan_target=scan_target
+            ):
+                self.log.debug(
+                    "classify(%s): OAuth/OIDC delegation detected -> oauth",
+                    scan_target,
+                )
                 return OAUTH
 
             if legacy in (OPEN, CLOSED):
+                self.log.debug(
+                    "classify(%s): legacy register signal -> %s",
+                    scan_target, legacy,
+                )
                 return legacy
 
+            self.log.debug(
+                "classify(%s): no trustworthy signal from any probe -> unknown",
+                scan_target,
+            )
             return UNKNOWN
         except Exception as e:  # noqa: BLE001 -- never let a scan raise
             self.log.debug("classify(%s) unexpected error: %s", scan_target, e)
@@ -212,7 +238,7 @@ class RegistrationChecker:
 
     # --- resolution ----------------------------------------------------------
 
-    async def _base_url(self, scan_target: str) -> tuple[Optional[str], Optional[dict]]:
+    async def _base_url(self, scan_target: str) -> tuple[str | None, dict[str, Any] | None]:
         """Resolve the client base URL and return the raw client well-known doc
         alongside it (reused by oauth detection to avoid a second fetch).
 
@@ -222,7 +248,7 @@ class RegistrationChecker:
         """
         well_known = await self._fetch_client_well_known(scan_target)
 
-        base_url: Optional[str] = None
+        base_url: str | None = None
         if isinstance(well_known, dict):
             hs = well_known.get("m.homeserver")
             if isinstance(hs, dict) and isinstance(hs.get("base_url"), str) and hs["base_url"]:
@@ -245,11 +271,14 @@ class RegistrationChecker:
 
         return base_url, well_known if isinstance(well_known, dict) else None
 
-    async def _fetch_client_well_known(self, scan_target: str) -> Optional[Any]:
+    async def _fetch_client_well_known(self, scan_target: str) -> Any | None:
         """Fetch and size-cap /.well-known/matrix/client. None on any failure."""
         try:
             parsed = parse_name(scan_target)
         except ValueError:
+            self.log.debug(
+                "client well-known(%s): unparseable server name", scan_target
+            )
             return None
         url = f"https://{parsed.host}/.well-known/matrix/client"
         try:
@@ -259,14 +288,25 @@ class RegistrationChecker:
                 allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
+                    self.log.debug(
+                        "client well-known(%s): HTTP %d -> no client well-known;"
+                        " using https://<host> as base URL",
+                        scan_target, resp.status,
+                    )
                     return None
                 return await read_json_capped(resp)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self.log.debug(
+                "client well-known(%s): fetch failed (%s) -> no client "
+                "well-known; using https://<host> as base URL", scan_target, e,
+            )
             return None
 
     # --- probes --------------------------------------------------------------
 
-    async def _probe_register(self, base_url: str) -> Optional[str]:
+    async def _probe_register(
+        self, base_url: str, *, scan_target: str = "-"
+    ) -> str | None:
         """Probe POST /_matrix/client/v3/register with an empty body.
 
         Returns dangerously_open / open / closed when the response is a
@@ -296,33 +336,62 @@ class RegistrationChecker:
                 if status not in (400, 401, 403):
                     # 404 / 5xx / 429 / 200-with-junk / anything else -> no
                     # trustworthy signal.
+                    self.log.debug(
+                        "register probe(%s): HTTP %d -> no legacy signal",
+                        scan_target, status,
+                    )
                     return None
                 # Read the body for all three handled codes. A 403's errcode is
                 # what distinguishes a real "registration disabled" from an
                 # unrelated forbidden (WAF / IP allowlist / flow rejection).
                 body = await read_json_capped(resp)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self.log.debug(
+                "register probe(%s): request failed: %s", scan_target, e
+            )
             return None
 
         if status == 401:
             # UIA challenge: the body advertises the available flows.
-            return classify_register_body(body)
+            verdict = classify_register_body(body)
+            self.log.debug(
+                "register probe(%s): 401 UIA -> %s", scan_target,
+                verdict if verdict is not None else "no usable flows (no signal)",
+            )
+            return verdict
 
         if status == 403:
             # Affirmative refusal ONLY if the body says M_FORBIDDEN. Anything
             # else (other errcode, non-dict body, unparseable/oversize -> None)
             # is not a trustworthy "disabled" signal and must not become closed.
             if isinstance(body, dict) and body.get("errcode") == "M_FORBIDDEN":
+                self.log.debug(
+                    "register probe(%s): 403 M_FORBIDDEN -> closed", scan_target
+                )
                 return CLOSED
+            errcode = body.get("errcode") if isinstance(body, dict) else None
+            self.log.debug(
+                "register probe(%s): 403 errcode=%s -> no signal (not treated "
+                "as closed)", scan_target, errcode,
+            )
             return None
 
         # status == 400: M_UNRECOGNIZED means the endpoint isn't served (common
         # on OAuth-delegated servers) -> no legacy signal, not closed. Any other
         # 400 is likewise not a trustworthy registration signal.
+        errcode = body.get("errcode") if isinstance(body, dict) else None
+        self.log.debug(
+            "register probe(%s): 400 errcode=%s -> no legacy signal",
+            scan_target, errcode,
+        )
         return None
 
     async def _is_oauth_delegated(
-        self, base_url: str, well_known: Optional[dict]
+        self,
+        base_url: str,
+        well_known: dict[str, Any] | None,
+        *,
+        scan_target: str = "-",
     ) -> bool:
         """Detect OAuth/OIDC delegation (MSC2965).
 
@@ -337,6 +406,10 @@ class RegistrationChecker:
             for key in ("m.authentication", "org.matrix.msc2965.authentication"):
                 block = well_known.get(key)
                 if isinstance(block, dict) and isinstance(block.get("issuer"), str) and block["issuer"]:
+                    self.log.debug(
+                        "oauth probe(%s): issuer in client well-known %s",
+                        scan_target, key,
+                    )
                     return True
 
         # 2) auth_metadata endpoint (v1, then the unstable fallback MAS serves).
@@ -356,6 +429,9 @@ class RegistrationChecker:
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
             if isinstance(data, dict) and isinstance(data.get("issuer"), str) and data["issuer"]:
+                self.log.debug(
+                    "oauth probe(%s): issuer at %s", scan_target, path
+                )
                 return True
 
         return False
@@ -383,10 +459,10 @@ class Scanner:
         self,
         timeout: float,
         log: logging.Logger,
-        client: Optional[aiohttp.ClientSession] = None,
-        pool_limit: Optional[int] = None,
+        client: aiohttp.ClientSession | None = None,
+        pool_limit: int | None = None,
         fetch_support: bool = True,
-        ip_policy: Optional[IPRangePolicy] = None,
+        ip_policy: IPRangePolicy | None = None,
     ) -> None:
         self.timeout = timeout
         self.log = log
@@ -415,8 +491,8 @@ class Scanner:
 
     @staticmethod
     def _build_client(
-        ip_policy: Optional[IPRangePolicy] = None,
-        log: Optional[logging.Logger] = None,
+        ip_policy: IPRangePolicy | None = None,
+        log: logging.Logger | None = None,
     ) -> aiohttp.ClientSession:
         return aiohttp.ClientSession(
             headers={

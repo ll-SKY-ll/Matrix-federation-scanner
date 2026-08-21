@@ -35,7 +35,7 @@ import pkgutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-log = logging.getLogger(__name__)
+_LOG = logging.getLogger(__name__)
 
 _PSL_RESOURCE = "public_suffix_list.dat"
 
@@ -289,7 +289,9 @@ def validate_psl_text(text: str, *, source: str) -> PublicSuffixList:
     return psl
 
 
-def load_vendored_psl(path: Path | None = None) -> PublicSuffixList:
+def load_vendored_psl(
+    path: Path | None = None, log: logging.Logger | None = None
+) -> PublicSuffixList:
     """Parse the vendored copy. This is the floor, and it must always work.
 
     Read via the module loader / pkgutil, NOT Path(__file__).read_text(). maubot
@@ -313,7 +315,7 @@ def load_vendored_psl(path: Path | None = None) -> PublicSuffixList:
         data, source = _read_resource()
         text = data.decode("utf-8")
     psl = PublicSuffixList(text, source=f"vendored ({source})")
-    log.info("loaded vendored public suffix list: %s", psl.describe())
+    (log or _LOG).info("loaded vendored public suffix list: %s", psl.describe())
     return psl
 
 
@@ -336,8 +338,13 @@ class PSLHolder:
     be able to adopt one -- which it cannot do through a `None` holder.
     """
 
-    def __init__(self, initial: PublicSuffixList | None = None) -> None:
+    def __init__(
+        self,
+        initial: PublicSuffixList | None = None,
+        log: logging.Logger | None = None,
+    ) -> None:
         self.current = initial
+        self._log = log or _LOG
 
     @property
     def version(self) -> datetime | None:
@@ -365,8 +372,8 @@ class PSLHolder:
             return False
         previous = self.describe()
         self.current = candidate
-        log.info("adopted public suffix list %s (was %s)",
-                 candidate.describe(), previous)
+        self._log.info("adopted public suffix list %s (was %s)",
+                       candidate.describe(), previous)
         return True
 
 

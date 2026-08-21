@@ -1,0 +1,9 @@
+# pinned to python 3.10 because thats the min version in current maubot
+target-version = "py310"
+line-length = 100 
+
+[lint]
+extend-select = ["BLE"]
+
+[lint.isort]
+known-first-party = ["csreg_scanner"]

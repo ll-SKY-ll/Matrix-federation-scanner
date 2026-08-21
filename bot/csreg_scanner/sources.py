@@ -107,7 +107,7 @@ class PolicyListSource:
 
     name = "policy_list"
 
-    def __init__(self, policy: "PolicyProvider", log: logging.Logger):
+    def __init__(self, policy: PolicyProvider, log: logging.Logger):
         self.policy = policy
         self.log = log
 
@@ -145,7 +145,7 @@ class PostgresSource:
         self.dsn = dsn
         self.query = query
         self.log = log
-        self._pool: "asyncpg.Pool | None" = None
+        self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
         if asyncpg is None:
@@ -170,9 +170,8 @@ class PostgresSource:
         # refuse the write regardless of how the statement is spelled, which is
         # the guarantee the docstring claims. The dedicated SELECT-only role is
         # still the real boundary; this is defence in depth that costs nothing.
-        async with self._pool.acquire() as conn:
-            async with conn.transaction(readonly=True):
-                rows = await conn.fetch(self.query)
+        async with self._pool.acquire() as conn, conn.transaction(readonly=True):
+            rows = await conn.fetch(self.query)
         # Edge validation (defense in depth): the central _clean gate in bot.py
         # is the authority, but drop anything here that isn't a valid Matrix
         # server name so a stray non-name row (NULL, a numeric id, a label) is

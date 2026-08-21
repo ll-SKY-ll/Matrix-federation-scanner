@@ -143,9 +143,8 @@ def validate_server_name(name: str) -> bool:
             return False
         bracket = name[: close + 1]
         rest = name[close + 1:]
-        if rest:
-            if not rest.startswith(":") or not _valid_port(rest[1:]):
-                return False
+        if rest and (not rest.startswith(":") or not _valid_port(rest[1:])):
+            return False
         return _valid_ipv6_literal(bracket)
 
     host = name

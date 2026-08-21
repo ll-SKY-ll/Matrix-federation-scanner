@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
 
@@ -59,7 +59,7 @@ _VERSION_READ_TIMEOUT = 8.0
 _FIELD_CHAR_CAP = 60
 
 
-def _truncate_field(value: Any) -> Optional[str]:
+def _truncate_field(value: Any) -> str | None:
     """Normalize one reported field into a stored value.
 
     Returns None when the value is not a non-empty string (caller treats the
@@ -92,11 +92,11 @@ class FederationVersion:
     """
 
     authoritative: bool
-    name: Optional[str] = None
-    version: Optional[str] = None
+    name: str | None = None
+    version: str | None = None
 
     @classmethod
-    def no_signal(cls) -> "FederationVersion":
+    def no_signal(cls) -> FederationVersion:
         """A non-authoritative result: the caller preserves prior stored values."""
         return cls(False, None, None)
 
@@ -114,8 +114,8 @@ class FederationVersionProbe:
         self,
         client: aiohttp.ClientSession,
         log: logging.Logger,
-        pool_limit: Optional[int] = None,
-        ip_policy: Optional[IPRangePolicy] = None,
+        pool_limit: int | None = None,
+        ip_policy: IPRangePolicy | None = None,
     ) -> None:
         self.log = log
         # The injected client carries the connection pool / headers we want, but
@@ -132,7 +132,7 @@ class FederationVersionProbe:
         # and this pool cannot silently queue beneath it. When not given
         # (standalone/CLI use, no admission gate) aiohttp's own default of 100
         # is kept.
-        self._resolver = ServerResolver(client)
+        self._resolver = ServerResolver(client, log=log)
         #
         # ip_policy: this session is the one MOST in need of the address filter.
         # It connects to whatever host:port the target's own well-known named
@@ -180,7 +180,7 @@ class FederationVersionProbe:
             self.log.debug("fedversion resolve(%s) failed: %s", scan_target, e)
             return FederationVersion.no_signal()
 
-        last_error: Optional[BaseException] = None
+        last_error: BaseException | None = None
         for index, target in enumerate(targets):
             url = self._version_url(target)
             # Honor the federation Host header (delegated/original name, per branch).
@@ -193,6 +193,11 @@ class FederationVersionProbe:
                     allow_redirects=False,
                 ) as resp:
                     if resp.status != 200:
+                        self.log.debug(
+                            "fedversion probe(%s): HTTP %d on %s:%d -> no "
+                            "version signal", scan_target, resp.status,
+                            target.host, target.port,
+                        )
                         return FederationVersion.no_signal()
                     body = await read_json_capped(resp)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -203,7 +208,14 @@ class FederationVersionProbe:
                     "left): %s", scan_target, target.host, target.port, remaining, e,
                 )
                 continue
-            return self._interpret(body)
+            result = self._interpret(body)
+            self.log.debug(
+                "fedversion probe(%s): %s on %s:%d -> name=%s version=%s",
+                scan_target,
+                "authoritative" if result.authoritative else "non-authoritative",
+                target.host, target.port, result.name, result.version,
+            )
+            return result
 
         if last_error is not None:
             self.log.debug(
@@ -242,4 +254,3 @@ class FederationVersionProbe:
         name = _truncate_field(server.get("name"))
         version = _truncate_field(server.get("version"))
         return FederationVersion(True, name, version)
-    

@@ -11,10 +11,69 @@ on:
       - main
 
 jobs:
+  # Single job, no matrix: Forgejo runner 13.0.0 ignores strategy.max-parallel,
+  # so a matrix over Python versions runs all jobs CONCURRENTLY against the one
+  # shared Postgres (CT_150_POSTGRES). Their per-test `DROP SCHEMA public
+  # CASCADE` resets then stomp each other -- surfacing as pg_type unique
+  # violations, phantom missing tables, and stale COUNT()s that vanish on an
+  # individual rerun. Collapsing the matrix into one job that loops the versions
+  # sequentially removes the concurrency entirely: one job = one runner slot =
+  # nothing for the runner to parallelize. All versions run; failures are
+  # collected and reported at the end.
   test:
     runs-on: [debian-host]
     env:
       TEST_POSTGRES_DSN: ${{ secrets.CT_150_POSTGRES }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bootstrap uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run tests across Python versions (sequential)
+        working-directory: bot
+        run: |
+          set -u
+          echo "TEST_POSTGRES_DSN length: ${#TEST_POSTGRES_DSN}"
+          if [ -z "$TEST_POSTGRES_DSN" ]; then
+            echo "TEST_POSTGRES_DSN is empty -- postgres tests would skip. Failing."
+            exit 1
+          fi
+
+          versions="3.10 3.11 3.12 3.13 3.14"
+          failed=""
+
+          for v in $versions; do
+            echo "::group::Python $v"
+            echo "===== Python $v ====="
+
+            # Each version gets its own venv so installs don't bleed across runs.
+            # A failure in any single step for a version records that version and
+            # moves on, rather than aborting the whole loop (run-all semantics).
+            if uv python install "$v" \
+              && uv venv --python "$v" ".venv-$v" \
+              && uv pip install --python ".venv-$v/bin/python" -r requirements-dev.txt \
+              && ".venv-$v/bin/python" -m pytest -v; then
+              echo "Python $v: PASS"
+            else
+              echo "Python $v: FAIL"
+              failed="$failed $v"
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "=================================================="
+          if [ -n "$failed" ]; then
+            echo "FAILED on Python version(s):$failed"
+            exit 1
+          fi
+          echo "All Python versions passed."
+
+  typecheck:
+    runs-on: [debian-host]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,15 +86,8 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run tests
+      - name: Run mypy
         working-directory: bot
-        env:
-          TEST_POSTGRES_DSN: ${{ secrets.CT_150_POSTGRES }}
         run: |
-          echo "TEST_POSTGRES_DSN length: ${#TEST_POSTGRES_DSN}"
-          if [ -z "$TEST_POSTGRES_DSN" ]; then
-            echo "TEST_POSTGRES_DSN is empty in the pytest step — postgres tests will skip."
-            exit 1
-          fi
           . .venv/bin/activate
-          pytest -v
+          mypy csreg_scanner

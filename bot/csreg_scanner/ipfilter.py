@@ -22,10 +22,11 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import aiohttp
-from aiohttp.abc import AbstractResolver
+from aiohttp.abc import AbstractResolver, ResolveResult
 
 _Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -187,8 +188,8 @@ class FilteringResolver(AbstractResolver):
         self._inner = inner if inner is not None else aiohttp.ThreadedResolver()
 
     async def resolve(
-        self, host: str, port: int = 0, family: int = socket.AF_INET
-    ) -> list[dict[str, Any]]:
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
         infos = await self._inner.resolve(host, port, family)
         allowed = [info for info in infos if self._policy.allows(info["host"])]
         if not allowed:
@@ -243,7 +244,9 @@ class FilteringTCPConnector(aiohttp.TCPConnector):
         self._ip_policy = ip_policy
         self._ip_log = ip_log
 
-    async def _resolve_host(self, host: str, port: int, *args: Any, **kwargs: Any):
+    async def _resolve_host(
+        self, host: str, port: int, *args: Any, **kwargs: Any
+    ) -> list[ResolveResult]:
         infos = await super()._resolve_host(host, port, *args, **kwargs)
         allowed = [info for info in infos if self._ip_policy.allows(info["host"])]
         if not allowed:

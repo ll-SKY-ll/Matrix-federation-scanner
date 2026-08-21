@@ -51,8 +51,7 @@ from __future__ import annotations
 
 import pytest
 
-from csreg_scanner.db import DB, ScanRecord
-
+from csreg_scanner.db import DB
 
 # Real status vocabulary (taxonomy.KNOWN_STATUSES). Using real values so a
 # vocabulary change surfaces here rather than the tests drifting into fiction.

@@ -17,17 +17,20 @@ from typing import Any
 
 import aiohttp
 from aiohttp.web import Request, Response
-from maubot import Plugin
+from maubot import Plugin  # type: ignore[attr-defined]
 from maubot.handlers import web
+from mautrix.api import Method, Path
 from mautrix.client import EventHandler
 from mautrix.types import EventType, RoomID, StateEvent
 from mautrix.util.async_db import UpgradeTable
-from mautrix.api import Method, Path
+from mautrix.util.config import BaseProxyConfig
 
 from .config import Config
 from .db import DB, upgrade_table
 from .ipfilter import IPRangePolicy, build_connector, parse_networks
+from .logcontext import ScanTargetFilter, bind_scan_target
 from .metrics import MetricsServer
+from .policy import POLICY_RULE_SERVER, PolicyManager
 from .psl import (
     PSLHolder,
     PSLValidationError,
@@ -35,7 +38,6 @@ from .psl import (
     validate_psl_text,
 )
 from .pslfetch import PSLFetcher, jittered_interval
-from .policy import POLICY_RULE_SERVER, PolicyManager
 from .regcheck import Scanner
 from .sources import PolicyListSource, PostgresSource, Source, TextFileSource
 from .taxonomy import KNOWN_STATUSES
@@ -168,7 +170,13 @@ class CSRegScanner(Plugin):
     db: DB
     scanner: Scanner
     policy: PolicyManager
-    metrics: MetricsServer | None
+    metrics: MetricsServer | None = None
+    _pg: PostgresSource | None = None
+
+    @property
+    def cfg(self) -> BaseProxyConfig:
+        assert self.config is not None, "config accessed before load"
+        return self.config
 
     @classmethod
     def get_config_class(cls) -> type[Config]:
@@ -181,10 +189,33 @@ class CSRegScanner(Plugin):
     # --- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
+        assert self.config is not None, "start() requires loaded config"
+        assert self.database is not None, "start() requires a database"
         self.config.load_and_update()
+
+        # Logging verbosity config, unrelated to maubots own setting so this
+        # plugin can have log levels independently of whats set in the global
+        # maubot yaml.
+        # A typo'd level falls back to INFO with an alarm rather than raising.
+        level_name = str(self.cfg["log_level"]).upper()
+        level = getattr(logging, level_name, None)
+        if not isinstance(level, int):
+            self.log.warning(
+                "log_level %r not recognized; using INFO", self.cfg["log_level"],
+                extra={"csreg_alarm": "log_level_invalid",
+                       "value": self.cfg["log_level"]},
+            )
+            level = logging.INFO
+        self.log.setLevel(level)
+        # Attach the per-scan context filter once. The logger object survives a
+        # config reload (it is maubot's, not ours), so guard against stacking a
+        # duplicate filter on each restart.
+        if not any(isinstance(f, ScanTargetFilter) for f in self.log.filters):
+            self.log.addFilter(ScanTargetFilter())
+
         self.db = DB(self.database)
 
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task[None]] = []
         self._avg_scan: float = 5.0  # seed; refined by EWMA (metrics only)
         # In-flight scans, keyed by scan_target. One structure, three jobs:
         #   (a) strong refs so the GC can't collect a running scan mid-flight
@@ -198,7 +229,7 @@ class CSRegScanner(Plugin):
         #       genuinely-due servers should have gotten;
         #   (c) admission control: len(self._inflight) vs _max_inflight is the
         #       ONE concurrency limiter (see _max_inflight below).
-        self._inflight: dict[str, asyncio.Task] = {}
+        self._inflight: dict[str, asyncio.Task[None]] = {}
 
         # Global in-flight ceiling. DERIVED from the two batch knobs the
         # operator already tunes -- deliberately NOT a third config option, so
@@ -208,8 +239,8 @@ class CSRegScanner(Plugin):
         # leased/reclaimable, rescan credit is retained).
         self._max_inflight: int = max(
             1,
-            int(self.config["queue.scan_batch_limit"])
-            + int(self.config["rescan.batch_limit"]),
+            int(self.cfg["queue.scan_batch_limit"])
+            + int(self.cfg["rescan.batch_limit"]),
         )
 
         # Rescan rate-meter (leaky bucket). Each tick we add required_rate*interval
@@ -221,7 +252,7 @@ class CSRegScanner(Plugin):
 
         # Per-status staleness T (seconds), sanitized once at config load.
         self._staleness: dict[str, int] = _sanitize_staleness(
-            self.config["rescan.staleness_seconds"], self.log
+            self.cfg["rescan.staleness_seconds"], self.log
         )
         # scanner: in-process registration checker over a shared aiohttp client.
         # The client is pooled across all scans and closed in stop(); the
@@ -246,11 +277,11 @@ class CSRegScanner(Plugin):
         # break under the default blacklist).
         self._ip_policy = IPRangePolicy(
             parse_networks(
-                self.config["scanner.ip_range_blacklist"], self.log,
+                self.cfg["scanner.ip_range_blacklist"], self.log,
                 field="ip_range_blacklist", strict=True,
             ),
             parse_networks(
-                self.config["scanner.ip_range_whitelist"], self.log,
+                self.cfg["scanner.ip_range_whitelist"], self.log,
                 field="ip_range_whitelist",
             ),
         )
@@ -263,11 +294,11 @@ class CSRegScanner(Plugin):
             trust_env=False,
         )
         self.scanner = Scanner(
-            float(self.config["scanner.timeout_seconds"]),
+            float(self.cfg["scanner.timeout_seconds"]),
             self.log,
             client=self._http_client,
             pool_limit=self._max_inflight,
-            fetch_support=bool(self.config["scanner.fetch_support"]),
+            fetch_support=bool(self.cfg["scanner.fetch_support"]),
             ip_policy=self._ip_policy,
         )
 
@@ -283,7 +314,7 @@ class CSRegScanner(Plugin):
         # nothing either way (PSLFetcher does no I/O in __init__), but it makes
         # the guarantee local instead of something you have to trace the call
         # graph to confirm.
-        self._psl_auto_update = bool(self.config["policy.psl_auto_update"])
+        self._psl_auto_update = bool(self.cfg["policy.psl_auto_update"])
         self._psl_fetcher = (
             PSLFetcher(self.http, self.log) if self._psl_auto_update else None
         )
@@ -296,9 +327,9 @@ class CSRegScanner(Plugin):
         self._psl_holder = await self._load_psl_local()
         self.policy = PolicyManager(
             self.client,
-            RoomID(self.config["policy_room"]),
-            auto_config_type=self.config["auto_config_event_type"],
-            max_writes_per_second=float(self.config["policy.max_writes_per_second"]),
+            RoomID(self.cfg["policy_room"]),
+            auto_config_type=self.cfg["auto_config_event_type"],
+            max_writes_per_second=float(self.cfg["policy.max_writes_per_second"]),
             known_statuses=KNOWN_STATUSES,
             log=self.log,
             domain_statuses=self.db.statuses_for_domain,
@@ -336,7 +367,7 @@ class CSRegScanner(Plugin):
         self._sources: list[tuple[Source, int]] = []
         # textfiles: the only multi-instance source. List of independent pull
         # sources, each on its own clock, all feeding the same queue.
-        for entry in (self.config["sources.textfiles"] or []):
+        for entry in (self.cfg["sources.textfiles"] or []):
             if not entry.get("enabled", True):
                 continue
             url = entry.get("url")
@@ -352,19 +383,19 @@ class CSRegScanner(Plugin):
                 int(entry.get("interval_seconds", 3600)),
             ))
         self._pg: PostgresSource | None = None
-        if self.config["sources.postgres.enabled"]:
+        if self.cfg["sources.postgres.enabled"]:
             try:
                 # Construction validates the query is SELECT-only and can raise;
                 # connect can fail on a bad DSN. Either disables the source
                 # rather than killing the plugin.
                 self._pg = PostgresSource(
-                    self.config["sources.postgres.dsn"],
-                    self.config["sources.postgres.query"],
+                    self.cfg["sources.postgres.dsn"],
+                    self.cfg["sources.postgres.query"],
                     self.log,
                 )
                 await self._pg.connect()
                 self._sources.append(
-                    (self._pg, int(self.config["sources.postgres.interval_seconds"]))
+                    (self._pg, int(self.cfg["sources.postgres.interval_seconds"]))
                 )
             except Exception as e:  # noqa: BLE001 -- don't let a bad DSN/query kill the plugin
                 self.log.error("postgres source disabled: %s", e,
@@ -373,23 +404,23 @@ class CSRegScanner(Plugin):
 
         # Policy list as a source: re-verify domains already in the shared room.
         # No connect step -- it just reads policy's in-memory fold.
-        if self.config["sources.policy_list.enabled"]:
+        if self.cfg["sources.policy_list.enabled"]:
             self._sources.append((
                 PolicyListSource(self.policy, self.log),
-                int(self.config["sources.policy_list.interval_seconds"]),
+                int(self.cfg["sources.policy_list.interval_seconds"]),
             ))
 
         # metrics server (own address, toggleable)
         self.metrics = None
-        if self.config["metrics.enabled"]:
+        if self.cfg["metrics.enabled"]:
             self.metrics = MetricsServer(
-                self.config["metrics.listen_host"],
-                int(self.config["metrics.listen_port"]),
-                self.config["metrics.path"],
-                self.config["metrics.counts_path"],
+                self.cfg["metrics.listen_host"],
+                int(self.cfg["metrics.listen_port"]),
+                self.cfg["metrics.path"],
+                self.cfg["metrics.counts_path"],
                 self._metrics_snapshot,
                 self.log,
-                expose_per_server=bool(self.config["metrics.expose_per_server"]),
+                expose_per_server=bool(self.cfg["metrics.expose_per_server"]),
             )
             await self.metrics.start()
 
@@ -445,7 +476,7 @@ class CSRegScanner(Plugin):
         """
         vendored = None
         try:
-            vendored = load_vendored_psl()
+            vendored = load_vendored_psl(log=self.log)
         except Exception as e:  # noqa: BLE001 -- packaging/IO failure
             self.log.error(
                 "vendored public suffix list unavailable: %s", e,
@@ -479,7 +510,7 @@ class CSRegScanner(Plugin):
                 "per-eTLD+1 ban cap cannot be enforced until a fetch succeeds",
                 extra={"csreg_alarm": "psl_unavailable"},
             )
-            return PSLHolder(None)
+            return PSLHolder(None, log=self.log)
         best = max(candidates, key=lambda p: p.version or datetime.min.replace(
             tzinfo=timezone.utc))
         self.log.info(
@@ -487,7 +518,7 @@ class CSRegScanner(Plugin):
             extra={"csreg_event": "psl_loaded", "psl_version": best.version_raw,
                    "psl_source": best.source},
         )
-        return PSLHolder(best)
+        return PSLHolder(best, log=self.log)
 
     async def _psl_refresh_loop(self) -> None:
         """Keep the suffix list fresh. Long-lived; cancelled by stop().
@@ -727,9 +758,9 @@ class CSRegScanner(Plugin):
         pending = list(getattr(self, "_tasks", [])) + inflight
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        if getattr(self, "_pg", None) is not None:
+        if self._pg is not None:
             await self._pg.close()
-        if getattr(self, "metrics", None) is not None:
+        if self.metrics is not None:
             await self.metrics.stop()
         # Close the scanner's owned resources before the shared client. The
         # scanner does NOT own the injected self._http_client (its aclose() is a
@@ -765,11 +796,10 @@ class CSRegScanner(Plugin):
             self.log.warning("error during config-reload stop(): %s", e)
         try:
             await self.start()
-        except Exception as e:  # noqa: BLE001
-            self.log.error(
+        except Exception as e:
+            self.log.exception(
                 "config reload failed in start(); plugin is NOT running until "
-                "the next successful config edit or maubot restart: %s", e,
-                exc_info=True,
+                "the next successful config edit or maubot restart",
                 extra={"csreg_alarm": "config_reload_failed", "error": str(e)},
             )
             # Best-effort teardown of whatever the failed start() half-built
@@ -798,7 +828,7 @@ class CSRegScanner(Plugin):
         if domains:
             self.log.debug("source %s ingested %d candidate(s)", source.name, len(domains))
 
-    def _clean(self, raw: list[str]) -> list[str]:
+    def _clean(self, raw: list[Any]) -> list[str]:
         """Validate and de-dupe a batch of raw names into scan targets.
 
         We keep the FULL server-name (with port if present) as the scan target:
@@ -850,7 +880,7 @@ class CSRegScanner(Plugin):
         and keep a defensive isinstance guard.
         """
         if not isinstance(evt, StateEvent):
-            return
+            return  # type: ignore[unreachable]
         # A config reload tears down (stop()) and rebuilds (start()) the plugin.
         # remove_event_handler unhooks us from the dispatch table, but mautrix
         # may already have SCHEDULED this coroutine (background_task.create) for
@@ -869,13 +899,13 @@ class CSRegScanner(Plugin):
         elif evt.type == policy.auto_config_type and evt.state_key == "":
             policy.apply_auto_config_event(evt.content)
 
-    @web.post("/ingest")
-    async def webhook_ingest(self, req: Request) -> Response:
+    @web.post("/ingest")  # type: ignore[arg-type]
+    async def webhook_ingest(self, req: Request) -> Response:  # type: ignore[misc]
         """Push ingress. Body: newline/space-separated names, or
         JSON {"servers": [...]}."""
-        if not self.config["sources.webhook.enabled"]:
+        if not self.cfg["sources.webhook.enabled"]:
             return Response(status=404)
-        secret = self.config["sources.webhook.secret"]
+        secret = self.cfg["sources.webhook.secret"]
         auth = req.headers.get("Authorization", "")
         # Constant-time compare to avoid leaking the secret via timing. An empty
         # configured secret hard-fails closed (never treat "" as open).
@@ -886,7 +916,7 @@ class CSRegScanner(Plugin):
         # non-ASCII str and turn an unauthenticated request into a 500 with a
         # traceback instead of a 401. surrogateescape round-trips whatever
         # arrived without raising.
-        expected = f"Bearer {secret}".encode("utf-8")
+        expected = f"Bearer {secret}".encode()
         provided = auth.encode("utf-8", "surrogateescape")
         if not secret or not hmac.compare_digest(provided, expected):
             return Response(status=401)
@@ -917,44 +947,43 @@ class CSRegScanner(Plugin):
     # metrics port stays bound to 127.0.0.1 and is never browser-reachable.
 
     def _counts_url(self) -> str:
-        host = self.config["metrics.listen_host"] or "127.0.0.1"
+        host = self.cfg["metrics.listen_host"] or "127.0.0.1"
         # A 0.0.0.0/:: listen host isn't a valid *connect* target; loop back.
         if host in ("0.0.0.0", "::"):
             host = "127.0.0.1"
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
-        port = int(self.config["metrics.listen_port"])
-        path = self.config["metrics.counts_path"]
+        port = int(self.cfg["metrics.listen_port"])
+        path = self.cfg["metrics.counts_path"]
         return f"http://{host}:{port}{path}"
 
-    @web.get("/calc/data")
-    async def calc_data(self, _req: Request) -> Response:
+    @web.get("/calc/data")  # type: ignore[arg-type]
+    async def calc_data(self, _req: Request) -> Response:  # type: ignore[misc]
         """Server-side fetch of the local /counts only. Pass-through to the
         browser so the metrics port need not be reachable from the client and
         no server list is ever pulled (we deliberately do NOT touch /metrics)."""
-        if not self.config["metrics.enabled"]:
+        if not self.cfg["metrics.enabled"]:
             return Response(status=503, text='{"error":"metrics disabled"}',
                             content_type="application/json")
         url = self._counts_url()
         try:
             timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout) as sess:
-                async with sess.get(url) as resp:
-                    if resp.status != 200:
-                        return Response(
-                            status=502,
-                            text=json.dumps({"error": f"counts {resp.status}"}),
-                            content_type="application/json",
-                        )
-                    body = await resp.text()
+            async with aiohttp.ClientSession(timeout=timeout) as sess, sess.get(url) as resp:
+                if resp.status != 200:
+                    return Response(
+                        status=502,
+                        text=json.dumps({"error": f"counts {resp.status}"}),
+                        content_type="application/json",
+                    )
+                body = await resp.text()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             return Response(status=502, text=json.dumps({"error": str(e)}),
                             content_type="application/json")
         # Echo the counts payload verbatim; the math lives client-side.
         return Response(text=body, content_type="application/json")
 
-    @web.get("/calc")
-    async def calc_page(self, _req: Request) -> Response:
+    @web.get("/calc")  # type: ignore[arg-type]
+    async def calc_page(self, _req: Request) -> Response:  # type: ignore[misc]
         """Self-hosted calculator UI. The page is a static asset shipped in the
         package (csreg_scanner/web/calc.html) -- no external assets (DSGVO): all
         CSS/JS inline, system font stack only. Loaded once and cached in
@@ -966,8 +995,8 @@ class CSRegScanner(Plugin):
     # --- scan tick (drains the queue, -----------------------------------------
 
     async def _scan_loop(self) -> None:
-        interval = int(self.config["queue.scan_interval_seconds"])
-        limit = int(self.config["queue.scan_batch_limit"])
+        interval = int(self.cfg["queue.scan_interval_seconds"])
+        limit = int(self.cfg["queue.scan_batch_limit"])
         # Lease window for a claimed queue row. The scan itself can't run past
         # the scanner timeout, but the lease clock starts at the CLAIM, and
         # under load there is real time between claim and task start (event-
@@ -978,7 +1007,7 @@ class CSRegScanner(Plugin):
         # for: a premature expiry is additionally harmless now, because the
         # in-flight guard turns a re-claimed running target into a skip, never
         # a duplicate launch).
-        lease_seconds = int(float(self.config["scanner.timeout_seconds"])) + 30
+        lease_seconds = int(float(self.cfg["scanner.timeout_seconds"])) + 30
         while True:
             try:
                 # Admission gate: only claim as many rows as there are free
@@ -1001,8 +1030,8 @@ class CSRegScanner(Plugin):
     # --- rescan tick (most-overdue,) ---------------------------------------------
 
     async def _rescan_loop(self) -> None:
-        interval = int(self.config["rescan.interval_seconds"])
-        limit = int(self.config["rescan.batch_limit"])
+        interval = int(self.cfg["rescan.interval_seconds"])
+        limit = int(self.cfg["rescan.batch_limit"])
         while True:
             try:
                 buckets = await self.db.bucket_counts()
@@ -1075,7 +1104,7 @@ class CSRegScanner(Plugin):
         task.add_done_callback(lambda t: self._scan_done(t, kind, scan_target))
         return True
 
-    def _scan_done(self, task: asyncio.Task, kind: str, scan_target: str) -> None:
+    def _scan_done(self, task: asyncio.Task[None], kind: str, scan_target: str) -> None:
         self._inflight.pop(scan_target, None)
         if task.cancelled():
             return
@@ -1111,6 +1140,10 @@ class CSRegScanner(Plugin):
         )
 
     async def _scan_one(self, scan_target: str) -> None:
+        # Bind the target for this scan so every line logged from here down the
+        # scanner call stack carries scan_target on the record.
+        # Task-scoped -- this coroutine runs as its own task, so no reset needed.
+        bind_scan_target(scan_target)
         t0 = time.monotonic()
         result, version, support = await self.scanner.scan(scan_target)
         dt = time.monotonic() - t0
@@ -1263,8 +1296,8 @@ class CSRegScanner(Plugin):
         # to drive config; they stay as metrics only). required > achievable is
         # the "falling behind on staleness" signal.
         required = self._required_rate(buckets)
-        interval = int(self.config["rescan.interval_seconds"])
-        batch = int(self.config["rescan.batch_limit"])
+        interval = int(self.cfg["rescan.interval_seconds"])
+        batch = int(self.cfg["rescan.batch_limit"])
         achievable = batch / interval if interval > 0 else 0.0
         return required, achievable
 
@@ -1294,10 +1327,10 @@ class CSRegScanner(Plugin):
                 },
             )
 
-    async def _metrics_snapshot(self) -> dict:
+    async def _metrics_snapshot(self) -> dict[str, Any]:
         # Skip the full scanned-table read when per-server series are disabled;
         # nothing else consumes `servers`, and bucket_counts is a cheap GROUP BY.
-        if self.config["metrics.expose_per_server"]:
+        if self.cfg["metrics.expose_per_server"]:
             servers = await self.db.all_statuses()
         else:
             servers = []
@@ -1312,8 +1345,8 @@ class CSRegScanner(Plugin):
         # the by-type counter) sits below this even with a full queue -- that
         # gap, alongside a nonzero queue depth, is the queue-path saturation
         # signal (paired with the scan_admission_deferred alarm saying why).
-        q_interval = int(self.config["queue.scan_interval_seconds"])
-        q_batch = int(self.config["queue.scan_batch_limit"])
+        q_interval = int(self.cfg["queue.scan_interval_seconds"])
+        q_batch = int(self.cfg["queue.scan_batch_limit"])
         initial_achievable = q_batch / q_interval if q_interval > 0 else 0.0
         required, achievable = self._rates(buckets)
         fed_versions = await self.db.fed_version_counts()
@@ -1361,11 +1394,11 @@ class CSRegScanner(Plugin):
                     "batch_limit": q_batch,
                 },
                 "rescan": {
-                    "interval": int(self.config["rescan.interval_seconds"]),
-                    "batch_limit": int(self.config["rescan.batch_limit"]),
+                    "interval": int(self.cfg["rescan.interval_seconds"]),
+                    "batch_limit": int(self.cfg["rescan.batch_limit"]),
                 },
             },
-            "scan_timeout": float(self.config["scanner.timeout_seconds"]),
+            "scan_timeout": float(self.cfg["scanner.timeout_seconds"]),
             "fed_versions": fed_versions,
             # Support-document coverage. Domain-granular (support_info is keyed
             # on the portless domain), unlike every other count here, which is
@@ -1373,4 +1406,3 @@ class CSRegScanner(Plugin):
             "support_total": support_total,
             "support_reachable": support_reachable,
         }
-    

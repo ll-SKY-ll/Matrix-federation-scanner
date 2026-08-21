@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from csreg_scanner.fedversion import FederationVersionProbe, _truncate_field
 
-
 _interpret = FederationVersionProbe._interpret
 
 

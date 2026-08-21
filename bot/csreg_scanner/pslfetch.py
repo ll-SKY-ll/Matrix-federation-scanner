@@ -25,15 +25,14 @@ import asyncio
 import logging
 import random
 from dataclasses import dataclass
-from typing import Optional
 
 import aiohttp
 
 from .psl import (
+    _MAX_FETCH_BYTES,
     PSL_URL,
     PSLValidationError,
     PublicSuffixList,
-    _MAX_FETCH_BYTES,
     validate_psl_text,
 )
 
@@ -55,9 +54,9 @@ class FetchOutcome:
     the log for the 364 days a year the list has not changed since our last poll.
     """
 
-    psl: Optional[PublicSuffixList] = None
+    psl: PublicSuffixList | None = None
     not_modified: bool = False
-    error: Optional[str] = None
+    error: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -82,8 +81,8 @@ class PSLFetcher:
         # request headers. Held in memory only: losing them across a restart
         # costs one extra full body, which is cheaper than persisting them and
         # having them disagree with the cached blob.
-        self._etag: Optional[str] = None
-        self._last_modified: Optional[str] = None
+        self._etag: str | None = None
+        self._last_modified: str | None = None
 
     async def fetch(self) -> FetchOutcome:
         requested_https = PSL_URL.startswith("https://")
