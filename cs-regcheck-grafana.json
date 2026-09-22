@@ -3,7 +3,7 @@
   "kind": "Dashboard",
   "metadata": {
     "name": "ad4brvd",
-    "generation": 37,
+    "generation": 39,
     "creationTimestamp": "2026-06-13T15:24:50Z",
     "labels": {},
     "annotations": {}
@@ -102,7 +102,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "bargauge",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "displayMode": "gradient",
@@ -195,7 +195,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "piechart",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "displayLabels": [
@@ -334,7 +334,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "annotations": {
@@ -542,7 +542,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "gauge",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "barShape": "flat",
@@ -667,7 +667,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "annotations": {
@@ -1046,7 +1046,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "cellHeight": "sm",
@@ -1399,7 +1399,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "cellHeight": "sm",
@@ -1495,7 +1495,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "colorMode": "none",
@@ -1599,7 +1599,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "cellHeight": "lg",
@@ -1686,8 +1686,8 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "builder",
-                        "expr": "csreg_scan_queue_depth{job=\"$job\"}",
-                        "legendFormat": "pending scans",
+                        "expr": "csreg_scans_inflight{job=\"$job\"}",
+                        "legendFormat": "scans in flight",
                         "range": true
                       },
                       "labels": {
@@ -1707,7 +1707,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "colorMode": "background",
@@ -1812,7 +1812,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "annotations": {
@@ -2010,7 +2010,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "cellHeight": "sm",
@@ -2116,7 +2116,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "annotations": {
@@ -2284,7 +2284,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "colorMode": "value",
@@ -2366,7 +2366,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "stat",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "colorMode": "background",
@@ -2449,7 +2449,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "annotations": {
@@ -2592,7 +2592,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "table",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "cellHeight": "lg",
@@ -2700,7 +2700,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "annotations": {
@@ -2822,7 +2822,7 @@
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.1.1",
+            "version": "13.2.0",
             "spec": {
               "options": {
                 "annotations": {
