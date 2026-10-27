@@ -66,11 +66,9 @@ class FetchOutcome:
 class PSLFetcher:
     """Fetches and validates the list over HTTPS.
 
-    Uses the caller's VERIFYING session. This is emphatically not the federation
-    version probe's verify-off client: that one exists to look at hostile servers
-    and disables certificate checks to do it, whereas this fetch feeds the data
-    that decides ban bucketing, so an unauthenticated or tampered response is a
-    correctness problem. Redirects are followed (publicsuffix.org has historically
+    Uses the caller's VERIFYING session: this fetch feeds the data that decides
+    ban bucketing, so an unauthenticated or tampered response is a correctness
+    problem. Redirects are followed (publicsuffix.org has historically
     redirected) but the scheme is pinned to https.
     """
 

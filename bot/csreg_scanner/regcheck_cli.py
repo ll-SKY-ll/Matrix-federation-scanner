@@ -240,7 +240,7 @@ async def check_one(
         out["register"] = await _capture_register_flows(checker, target, client)
 
         # Federation /version probe -- the same fed_name / fed_version that the
-        # bot stores in the DB. Its probe owns a private verify-off session, so
+        # bot stores in the DB. Its probe owns a private session, so
         # build it here and close it after. authoritative mirrors the DB's
         # overwrite-vs-preserve flag.
         probe = FederationVersionProbe(client, log)

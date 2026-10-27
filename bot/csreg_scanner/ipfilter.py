@@ -270,8 +270,8 @@ def build_connector(
 ) -> aiohttp.TCPConnector:
     """A connector that enforces `policy`, or a plain one when it is inert.
 
-    One place, so the three scan sessions (shared verifying client, the version
-    probe's verify-off client, and the CLI/standalone client) cannot drift apart
+    One place, so the three scan sessions (shared client, the version probe's
+    own client, and the CLI/standalone client) cannot drift apart
     on which of them filters.
     """
     if policy is None or not policy.active:

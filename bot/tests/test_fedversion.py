@@ -10,7 +10,12 @@ overwrites, while a missing key is non-authoritative and preserves prior state.
 
 from __future__ import annotations
 
+import logging
+
+import aiohttp
+
 from csreg_scanner.fedversion import FederationVersionProbe, _truncate_field
+from csreg_scanner.resolver import FederationTarget, ResolutionMethod
 
 _interpret = FederationVersionProbe._interpret
 
@@ -64,3 +69,104 @@ def test_truncate_caps_length():
 def test_truncate_non_string_is_none():
     assert _truncate_field(123) is None
     assert _truncate_field(None) is None
+
+
+# --- TLS: cert name passthrough + connector posture -------------------------
+
+
+def _target(host, port, host_header, tls_name, method=ResolutionMethod.SRV):
+    return FederationTarget(
+        host=host,
+        port=port,
+        host_header=host_header,
+        tls_server_name=tls_name,
+        resolution_method=method,
+    )
+
+
+class _StubResolver:
+    def __init__(self, targets):
+        self._targets = targets
+
+    async def resolve_candidates(self, server_name):
+        return self._targets
+
+
+class _Resp:
+    status = 404
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _RecordingGet:
+    """Stands in for session.get: records kwargs, fails the first `fail` calls
+    with a connection error, answers 404 after that (ends the walk)."""
+
+    def __init__(self, fail=0):
+        self.calls = []
+        self._fail = fail
+
+    def __call__(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if len(self.calls) <= self._fail:
+            raise aiohttp.ClientConnectionError("cert verify failed")
+        return _Resp()
+
+
+async def _probe_with(targets, get):
+    probe = FederationVersionProbe(client=None, log=logging.getLogger("t"))
+    probe._resolver = _StubResolver(targets)
+    real_client = probe._probe_client
+    probe._probe_client = type("C", (), {"get": get})()
+    try:
+        return await probe.probe("example.org")
+    finally:
+        await real_client.close()
+
+
+async def test_probe_connector_verifies_and_disables_keepalive():
+    probe = FederationVersionProbe(client=None, log=logging.getLogger("t"))
+    try:
+        conn = probe._probe_client.connector
+        assert conn.force_close is True
+        assert conn._ssl is not False
+    finally:
+        await probe.aclose()
+
+
+async def test_server_hostname_is_tls_server_name_not_connect_host():
+    get = _RecordingGet()
+    await _probe_with(
+        [_target("srv.host.net", 443, "example.org", "example.org")], get,
+    )
+    url, kwargs = get.calls[0]
+    assert url == "https://srv.host.net:443/_matrix/federation/v1/version"
+    assert kwargs["server_hostname"] == "example.org"
+    assert kwargs["headers"]["Host"] == "example.org"
+
+
+async def test_ip_literal_passes_none_server_hostname():
+    get = _RecordingGet()
+    await _probe_with(
+        [_target("2001:db8::1", 8448, "[2001:db8::1]", None,
+                 ResolutionMethod.IP_LITERAL)], get,
+    )
+    assert get.calls[0][1]["server_hostname"] is None
+
+
+async def test_tls_failure_advances_walk_with_per_candidate_name():
+    get = _RecordingGet(fail=1)
+    result = await _probe_with(
+        [
+            _target("a.host.net", 8448, "example.org", "example.org"),
+            _target("b.host.net", 8448, "example.org", "example.org"),
+        ],
+        get,
+    )
+    assert len(get.calls) == 2
+    assert all(kw["server_hostname"] == "example.org" for _, kw in get.calls)
+    assert result.authoritative is False

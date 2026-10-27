@@ -4,24 +4,24 @@ Fetches ``/_matrix/federation/v1/version`` from a server's resolved FEDERATION
 endpoint (NOT the client-server endpoint) and extracts the advertised
 ``server.name`` / ``server.version`` strings for the version-distribution metric.
 
-TLS posture: verification is DELIBERATELY relaxed (no cert chain/hostname/expiry
-checks) for this probe only. The version string is non-security-relevant
-reconnaissance feeding a metric -- a MITM's worst outcome is a wrong dashboard
-row, never a trust/policy decision. Doing federation-grade cert validation
-correctly would require per-branch SNI override (the cert name is the delegated
-/ original name, not the connect host, on every SRV-terminating branch), which
-is disproportionate machinery for a stats string. So we accept an unauthenticated
-read here.
+TLS posture: full federation-grade verification (chain, expiry, hostname). The
+certificate is checked against the name the spec requires for each resolution
+branch -- ``FederationTarget.tls_server_name`` (delegated / original name), sent
+as SNI via ``server_hostname`` -- NOT against the connect host, which on the SRV
+branches is the SRV target. For IP literals ``tls_server_name`` is None, so the
+cert is checked against the IP itself. A certificate failure is a transport
+failure: the candidate walk advances, and if nothing verifies the result is
+non-authoritative.
 
 Authoritative-answer contract (drives overwrite-vs-preserve in db.record_scan):
 an answer is AUTHORITATIVE iff the probe got HTTP 200, the body parsed as a JSON
 object, AND that object carried a ``server`` object containing BOTH the ``name``
 and ``version`` keys (their values MAY be null/empty -- the keys must be present).
 Anything else -- non-200, unparseable, oversize, missing either key, federation
-resolution failure, network error, timeout -- is NON-authoritative and the caller
-preserves any previously stored values. An authoritative answer overwrites the
-stored values with exactly what was reported (including overwriting a prior
-non-null to null).
+resolution failure, network error, TLS verification failure, timeout -- is
+NON-authoritative and the caller preserves any previously stored values. An
+authoritative answer overwrites the stored values with exactly what was
+reported (including overwriting a prior non-null to null).
 
 All HTTP reads are size-capped via resolver.read_json_capped; the probe never
 raises.
@@ -104,10 +104,9 @@ class FederationVersion:
 class FederationVersionProbe:
     """Resolves a server's federation endpoint and reads its version document.
 
-    A shared ``aiohttp.ClientSession`` is injected for connection pooling, but
-    note the version probe issues its requests with TLS verification relaxed
-    (see module docstring); it does this via a dedicated verify-disabled session
-    rather than mutating the shared client.
+    A shared ``aiohttp.ClientSession`` is injected for the resolver's well-known
+    fetches. The version GET itself goes through a dedicated session owned by
+    this probe, with its own pool limit and keep-alive disabled.
     """
 
     def __init__(
@@ -118,12 +117,10 @@ class FederationVersionProbe:
         ip_policy: IPRangePolicy | None = None,
     ) -> None:
         self.log = log
-        # The injected client carries the connection pool / headers we want, but
-        # we must issue the actual GET with verification disabled. aiohttp fixes
-        # the TLS posture on the connector at construction, so we keep a
-        # dedicated session whose connector has ssl=False for the probe. It does
-        # not own the injected client's lifecycle. The session owns this private
-        # connector (connector_owner defaults True), so close() tears it down.
+        # The version GET runs on a dedicated session rather than the injected
+        # client. It does not own the injected client's lifecycle. The session
+        # owns this private connector (connector_owner defaults True), so
+        # close() tears it down.
         #
         # pool_limit: the caller's scan-admission ceiling. Each in-flight scan
         # issues at most one version-probe request at a time, so a connector
@@ -139,7 +136,7 @@ class FederationVersionProbe:
         # The filter lives on the connector's resolver, so it applies to the 
         # resolved addresses rather than the name, and therefore also to a DNS 
         # name pointing at RFC1918.
-        self._verify_off = aiohttp.ClientSession(
+        self._probe_client = aiohttp.ClientSession(
             headers={
                 "User-Agent": "csreg-scanner (registration scanner; +https://github.com/ll-SKY-ll/Matrix-federation-scanner)",
                 "Accept": "application/json",
@@ -147,15 +144,15 @@ class FederationVersionProbe:
             connector=build_connector(
                 ip_policy,
                 log,
-                ssl=False,  # relaxed: recon only (see module docstring)
+                force_close=True,
                 limit=pool_limit if pool_limit is not None else 100,
             ),
             trust_env=False,
         )
 
     async def aclose(self) -> None:
-        """Close the dedicated verify-off client owned by this probe."""
-        await self._verify_off.close()
+        """Close the dedicated client owned by this probe."""
+        await self._probe_client.close()
 
     async def probe(self, scan_target: str) -> FederationVersion:
         """Resolve the federation endpoint for ``scan_target`` and read its
@@ -186,9 +183,10 @@ class FederationVersionProbe:
             # Honor the federation Host header (delegated/original name, per branch).
             headers = {"Host": target.host_header}
             try:
-                async with self._verify_off.get(
+                async with self._probe_client.get(
                     url,
                     headers=headers,
+                    server_hostname=target.tls_server_name,
                     timeout=build_timeout(_VERSION_READ_TIMEOUT),
                     allow_redirects=False,
                 ) as resp:
