@@ -473,10 +473,10 @@ class Scanner:
         self._owns_client = client is None
         self.client = client or self._build_client(ip_policy, log)
         self._checker = RegistrationChecker(self.client, log)
-        # Federation version probe. It keeps its OWN verify-disabled aiohttp
-        # session internally (regcheck's client verifies TLS; the version probe
-        # must not), so it is always closed by aclose() regardless of who owns
-        # self.client. pool_limit (the bot's scan-admission ceiling) is threaded
+        # Federation version probe. It keeps its OWN aiohttp session internally
+        # (it verifies against the federation cert name per request and runs
+        # without keep-alive), so it is always closed by aclose() regardless of
+        # who owns self.client. pool_limit (the bot's scan-admission ceiling) is threaded
         # through so the probe's private connection pool is sized to the same
         # ceiling and can never become a second, silent concurrency limiter.
         self._version = FederationVersionProbe(
@@ -588,7 +588,7 @@ class Scanner:
 
     async def aclose(self) -> None:
         """Close owned resources. The version probe always owns its private
-        verify-disabled client, so close it unconditionally. The main client is
+        client, so close it unconditionally. The main client is
         closed only when WE own it (the bot closes an injected shared client)."""
         await self._version.aclose()
         if self._owns_client:

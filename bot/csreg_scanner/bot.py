@@ -765,7 +765,7 @@ class CSRegScanner(Plugin):
         # Close the scanner's owned resources before the shared client. The
         # scanner does NOT own the injected self._http_client (its aclose() is a
         # no-op for that), but the federation version probe keeps its OWN
-        # verify-disabled client internally -- scanner.aclose() is the only thing
+        # private client internally -- scanner.aclose() is the only thing
         # that closes it, so skipping this leaks that client + its pool on every
         # stop()/config reload.
         if getattr(self, "scanner", None) is not None:
