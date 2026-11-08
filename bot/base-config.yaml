@@ -28,6 +28,7 @@ scanner:
   # An EMPTY blacklist disables filtering
   # entirely (no resolver wrapper is installed at all).
   ip_range_blacklist:
+    - "0.0.0.0/8"
     - "127.0.0.0/8"
     - "10.0.0.0/8"
     - "172.16.0.0/12"
@@ -47,6 +48,13 @@ scanner:
     - "2001:db8::/32"
     - "ff00::/8"
     - "fec0::/10"
+    # IPv4 translated into IPv6. Mapped ::ffff:a.b.c.d is unwrapped in code and
+    # checked against the IPv4 entries above, so it needs no entry here.
+    - "::/96"            # unspecified, ::1-style and deprecated IPv4-compatible
+    - "64:ff9b::/96"     # NAT64 well-known prefix
+    - "64:ff9b:1::/48"   # NAT64 local-use
+    - "2002::/16"        # 6to4
+    - "2001::/32"        # Teredo
   # Entries in the whitelist win over the blacklist
   ip_range_whitelist: []
 

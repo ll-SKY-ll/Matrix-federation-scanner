@@ -123,6 +123,64 @@ def test_allows_ipv6_denied_is_actually_denied():
     assert policy.allows("[::1]") is False   # bracketed form, same address
 
 
+def test_allows_ipv4_mapped_hits_ipv4_blacklist():
+    """An IPv4 target wrapped as ::ffff:a.b.c.d must hit the IPv4 entry.
+
+    ipaddress treats IPv6Address-in-IPv4Network as a plain non-match, so without
+    the unwrap [::ffff:127.0.0.1] sailed past 127.0.0.0/8 -- and the kernel
+    delivers that connect to IPv4 loopback. Both spellings of the same mapped
+    address, bracketed or not, must be denied.
+    """
+    policy = ipfilter.IPRangePolicy(blacklist=[_net("127.0.0.0/8"),
+                                               _net("10.0.0.0/8")])
+    assert policy.allows("::ffff:127.0.0.1") is False
+    assert policy.allows("[::ffff:7f00:1]") is False
+    assert policy.allows("::ffff:10.1.2.3") is False
+    assert policy.allows("::ffff:8.8.8.8") is True
+
+
+def test_allows_ipv4_mapped_honours_ipv4_whitelist():
+    """The unwrap runs BEFORE the whitelist too.
+
+    A split-horizon operator whitelisting 10.1.0.0/16 expects the mapped form of
+    the same address to pass as well; otherwise a dual-stack resolver handing
+    back ::ffff:10.1.x.x would block their own homeserver.
+    """
+    policy = ipfilter.IPRangePolicy(blacklist=[_net("10.0.0.0/8")],
+                                    whitelist=[_net("10.1.0.0/16")])
+    assert policy.allows("::ffff:10.1.0.5") is True
+    assert policy.allows("::ffff:10.2.0.5") is False
+
+
+@pytest.mark.parametrize("addr", [
+    "0.0.0.0",
+    "0.1.2.3",
+    "::",
+    "::127.0.0.1",                          # deprecated IPv4-compatible
+    "::ffff:127.0.0.1",                     # IPv4-mapped
+    "64:ff9b::7f00:1",                      # NAT64 well-known
+    "64:ff9b:1::a00:1",                     # NAT64 local-use
+    "2002:7f00:1::",                        # 6to4 of 127.0.0.1
+    "2001:0:4136:e378:8000:63bf:80ff:fffe", # Teredo
+])
+def test_default_blacklist_denies_translated_and_zero_addresses(addr):
+    """The shipped default must cover every IPv4-in-IPv6 and zero-address form.
+
+    Reads base-config.yaml directly so the test fails if someone trims the
+    default, not just if the matching code regresses.
+    """
+    import pathlib
+
+    from ruamel.yaml import YAML
+
+    cfg = pathlib.Path(__file__).resolve().parent.parent / "base-config.yaml"
+    entries = YAML(typ="safe").load(cfg.read_text())["scanner"]["ip_range_blacklist"]
+    policy = ipfilter.IPRangePolicy(
+        blacklist=ipfilter.parse_networks(entries, _LOG, field="b", strict=True)
+    )
+    assert policy.allows(addr) is False
+
+
 # ---------------------------------------------------------------------------
 # Unit 2: _parse_address -- the parser feeding allows().
 # ---------------------------------------------------------------------------

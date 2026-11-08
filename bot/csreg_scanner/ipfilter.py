@@ -13,8 +13,14 @@ blacklist.
 Split-horizon DNS is why BOTH lists are configurable: an operator whose own
 homeserver resolves to private space internally adds that prefix to
 ``ip_range_whitelist`` rather than gutting the blacklist. The default blacklist
-is Synapse's, verbatim, so an operator can copy their homeserver config across;
-the key names match Synapse's for the same reason.
+starts from Synapse's so an operator can copy their homeserver config across
+(the key names match Synapse's for the same reason), plus the entries Synapse
+adds implicitly in code (0.0.0.0, ::) and the IPv4-in-IPv6 translation
+prefixes (::/96, NAT64, 6to4, Teredo).
+
+IPv4-mapped addresses (::ffff:a.b.c.d) are unwrapped to IPv4 before matching,
+so every IPv4 range in either list also covers its mapped form -- the
+equivalent of Synapse generating a ::ffff: twin for each IPv4 entry.
 """
 
 from __future__ import annotations
@@ -160,6 +166,8 @@ class IPRangePolicy:
         ip = _parse_address(addr)
         if ip is None:
             return True
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
         if any(ip in net for net in self._allow):
             return True
         return not any(ip in net for net in self._deny)
